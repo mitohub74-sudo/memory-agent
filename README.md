@@ -189,3 +189,9 @@ CLI 与调用方无需改动；`cards.embedding` 列已预留。
 ## 环境
 
 Python 3.10+（已在 3.13、3.14 验证）。需 SQLite 支持 FTS5，Python 自带版本均满足。
+
+---
+
+## 许可证
+
+[MIT](LICENSE)

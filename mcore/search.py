@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .tokenize import query_terms, to_query_expr
+from .tokenize import query_terms, tokenize, to_query_expr
 
 __all__ = ["Hit", "Searcher", "KeywordSearcher"]
 
@@ -37,7 +37,7 @@ class Hit:
     source: str
     score: float          # 越大越相关
     snippet: str = ""
-    matched: str = "all"  # 实际生效的匹配模式：all(AND) / any(OR)
+    matched: str = "all"  # 实际生效的匹配档位：all / all-prefix / any / any-prefix
 
 
 @runtime_checkable
@@ -93,9 +93,30 @@ def make_snippet(body: str, query: str, width: int = 70) -> str:
 
 
 class KeywordSearcher:
-    """FTS5 + bigram 关键词检索。"""
+    """FTS5 + bigram 关键词检索。
+
+    匹配档位从精确到宽松，**前一档零召回才降级** —— 保证精确匹配的既有
+    行为不被放宽匹配污染：
+
+        1. ``all``         AND 精确，全部词整词命中
+        2. ``all-prefix``  AND 前缀，全部词前缀命中（``sqlite`` 命中 ``sqlite3``）
+        3. ``any``         OR  精确，任一整词命中
+        4. ``any-prefix``  OR  前缀，任一前缀命中
+
+    OR 档位的 BM25 排序不可靠：长文档和高频词会主导分数，出现「命中词更少
+    但排得更前」的情况 —— 表现为返回一堆看着相关、其实无关的卡。所以 OR
+    档位多取候选，先按「命中了几个查询词」重排，再截断。
+    """
 
     name = "keyword"
+
+    # (matched 值, 连接方式, 是否前缀)
+    TIERS = (
+        ("all", "all", False),
+        ("all-prefix", "all", True),
+        ("any", "any", False),
+        ("any-prefix", "any", True),
+    )
 
     def __init__(self, conn: sqlite3.Connection, *, fallback_any: bool = True) -> None:
         self.conn = conn
@@ -121,6 +142,30 @@ class KeywordSearcher:
         params.append(limit)
         return self.conn.execute("\n".join(sql), params).fetchall()
 
+    @staticmethod
+    def _coverage(row, terms: list[str]) -> int:
+        """这张卡命中了几个查询词（整词、大小写不敏感）。"""
+        toks = set(tokenize(row["title"])) | set(tokenize(row["body"]))
+        return sum(1 for t in terms if t in toks)
+
+    @classmethod
+    def _rank_by_coverage(cls, rows, terms: list[str]):
+        """先按命中词数降序，再按 BM25 升序（bm25 越小越相关）。"""
+        return sorted(rows, key=lambda r: (-cls._coverage(r, terms), float(r["score"])))
+
+    @staticmethod
+    def _to_hit(row, query: str, mode: str) -> Hit:
+        return Hit(
+            card_id=int(row["id"]),
+            rel_path=row["rel_path"],
+            title=row["title"],
+            kind=row["kind"],
+            source=row["source"],
+            score=-float(row["score"]),  # 取负，使「越大越相关」符合直觉
+            snippet=make_snippet(row["body"], query),
+            matched=mode,
+        )
+
     def search(
         self,
         query: str,
@@ -129,29 +174,21 @@ class KeywordSearcher:
         kind: str | None = None,
         source: str | None = None,
     ) -> list[Hit]:
-        expr = to_query_expr(query, "all")
-        if not expr:
+        terms = query_terms(query)
+        if not terms:
             return []
 
-        rows = self._run(expr, limit, kind, source)
-        mode = "all"
-
-        if not rows and self.fallback_any:
-            expr_any = to_query_expr(query, "any")
-            if expr_any:
-                rows = self._run(expr_any, limit, kind, source)
-                mode = "any"
-
-        return [
-            Hit(
-                card_id=int(r["id"]),
-                rel_path=r["rel_path"],
-                title=r["title"],
-                kind=r["kind"],
-                source=r["source"],
-                score=-float(r["score"]),  # 取负，使「越大越相关」符合直觉
-                snippet=make_snippet(r["body"], query),
-                matched=mode,
-            )
-            for r in rows
-        ]
+        tiers = self.TIERS if self.fallback_any else self.TIERS[:2]
+        for mode, joiner, prefix in tiers:
+            expr = to_query_expr(query, joiner, prefix=prefix)
+            if not expr:
+                continue
+            # OR 档位要重排，先多取候选再截断
+            pool = limit if joiner == "all" else max(limit * 5, 50)
+            rows = self._run(expr, pool, kind, source)
+            if not rows:
+                continue
+            if joiner == "any":
+                rows = self._rank_by_coverage(rows, terms)
+            return [self._to_hit(r, query, mode) for r in rows[:limit]]
+        return []

@@ -66,7 +66,7 @@ def query_terms(query: str) -> list[str]:
     return list(seen)
 
 
-def to_query_expr(query: str, mode: str = "all") -> str:
+def to_query_expr(query: str, mode: str = "all", *, prefix: bool = False) -> str:
     """把用户查询转成 FTS5 的 MATCH 表达式。
 
     每个 token 都加双引号，原因：FTS5 的 MATCH 语法里 ``- . /`` 等字符有
@@ -75,9 +75,22 @@ def to_query_expr(query: str, mode: str = "all") -> str:
 
     mode="all" -> 用 AND 连接（精确，默认）
     mode="any" -> 用 OR 连接（宽松，召回不足时降级使用）
+
+    prefix=True -> 词尾加 ``*`` 走 FTS5 前缀查询。
+
+    FTS5 的 MATCH 是【整词】匹配，正文里写了 ``sqlite3`` 就搜不到 ``sqlite``，
+    写了 ``requests`` 就搜不到 ``request``。代码类内容里这种后缀差异极常见，
+    所以需要前缀档位兜底。
+
+    只对长度 >= 2 的词加 ``*``：单字前缀会命中几乎所有卡片（实测 ``"a"*``
+    在 49 张卡的库里命中 45 张），纯噪音。
     """
     terms = query_terms(query)
     if not terms:
         return ""
     joiner = " AND " if mode == "all" else " OR "
-    return joiner.join(f'"{t}"' for t in terms)
+    parts = []
+    for t in terms:
+        star = "*" if prefix and len(t) >= 2 else ""
+        parts.append(f'"{t}"{star}')
+    return joiner.join(parts)

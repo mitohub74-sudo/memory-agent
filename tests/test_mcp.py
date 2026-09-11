@@ -279,8 +279,45 @@ def main() -> int:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
+        # ---------------------------------------------------- 检索档位
+        print("\n[9] 检索档位：前缀匹配与 OR 覆盖数重排")
+        tmp3 = tempfile.mkdtemp(prefix="memory-agent-tier-")
+        c3 = Client(env={
+            "MEMORY_AGENT_VAULT": str(Path(tmp3) / "vault"),
+            "MEMORY_AGENT_DB": str(Path(tmp3) / "memory.db"),
+        })
+        try:
+            c3.request("initialize", {"protocolVersion": "2025-06-18",
+                                      "capabilities": {},
+                                      "clientInfo": {"name": "test-agent", "version": "3.0"}})
+            c3.notify("notifications/initialized")
+
+            c3.request("tools/call", {"name": "memory_capture",
+                                      "arguments": {
+                                          "title": "档位测试卡",
+                                          "body": ("调用 getUserById 获取用户，再用 tokenizeText "
+                                                   "处理，依赖 sqlite3 和 requests 库。"),
+                                          "kind": "knowledge"}})
+            c3.request("tools/call", {"name": "memory_reindex", "arguments": {}})
+
+            def hits(query: str) -> str:
+                r = c3.request("tools/call", {"name": "memory_search",
+                                              "arguments": {"query": query}})
+                return r.get("result", {}).get("content", [{}])[0].get("text", "")
+
+            check("整词命中走 AND 精确档", "AND 精确" in hits("sqlite3"))
+            check("前缀档：sqlite 命中 sqlite3", "命中 1" in hits("sqlite"))
+            check("前缀档标注为 AND 前缀", "AND 前缀" in hits("sqlite"))
+            check("前缀档：request 命中 requests", "命中 1" in hits("request"))
+            check("前缀档：tokenize 命中 tokenizeText", "命中 1" in hits("tokenize"))
+            check("单字不加前缀，不放大噪音", "没有与" in hits("a"))
+            check("词中片段仍搜不到（已知局限，非缺陷）", "没有与" in hits("userById"))
+        finally:
+            c3.close()
+            shutil.rmtree(tmp3, ignore_errors=True)
+
         # ---------------------------------------------------- stdout 纯净
-        print("\n[9] stdout 纯净性（最关键）")
+        print("\n[10] stdout 纯净性（最关键）")
         bad = []
         for line in c.stdout_lines:
             if not line.strip():

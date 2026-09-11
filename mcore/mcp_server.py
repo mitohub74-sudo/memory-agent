@@ -215,7 +215,13 @@ class MemoryServer:
         if not hits:
             return _ok(f"记忆库中没有与「{query}」相关的内容。")
 
-        mode = "AND" if hits[0].matched == "all" else "OR（已放宽匹配）"
+        _MODE_LABEL = {
+            "all": "AND 精确",
+            "all-prefix": "AND 前缀",
+            "any": "OR（已放宽）",
+            "any-prefix": "OR + 前缀（已放宽）",
+        }
+        mode = _MODE_LABEL.get(hits[0].matched, hits[0].matched)
         lines = [f"命中 {len(hits)} 条  (query={query}, 匹配模式={mode})", ""]
         for i, h in enumerate(hits, 1):
             lines.append(f"[{i}] id={h.card_id}  {h.title}")

@@ -132,7 +132,7 @@ stdio 传输，每行一条 JSON-RPC 2.0 消息。协议版本 `2025-06-18` / `2
   "mcpServers": {
     "memory-agent": {
       "command": "python",
-      "args": ["E:\\X\\memory\\memory.py", "mcp"]
+      "args": ["/path/to/memory-agent/memory.py", "mcp"]
     }
   }
 }

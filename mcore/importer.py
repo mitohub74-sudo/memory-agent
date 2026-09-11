@@ -1,0 +1,145 @@
+# -*- coding: utf-8 -*-
+"""vault → SQLite 导入器。
+
+Markdown 是真相源，本模块负责把它读进索引。特点是**增量**：
+用 content_hash 比对，内容没变的卡片直接跳过，不重复写库。
+
+frontmatter 解析刻意不引入 PyYAML —— 只支持本项目实际用到的极简子集
+（``key: value`` 标量与 ``[a, b]`` 内联数组），保持零依赖。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from pathlib import Path
+
+from .store import delete_cards, upsert_card
+
+__all__ = ["parse_frontmatter", "build_card", "sync"]
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析 Markdown 开头的 YAML frontmatter，返回 (元数据, 正文)。"""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+
+    meta: dict = {}
+    for line in lines[1:end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in line:
+            continue
+        key, _, raw = line.partition(":")
+        key, raw = key.strip(), raw.strip()
+        if not key:
+            continue
+        if raw.startswith("[") and raw.endswith("]"):
+            inner = raw[1:-1].strip()
+            meta[key] = (
+                [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
+                if inner
+                else []
+            )
+        else:
+            meta[key] = raw.strip("'\"")
+
+    body = "\n".join(lines[end + 1 :]).strip()
+    return meta, body
+
+
+def _strip_duplicate_heading(body: str, title: str) -> str:
+    """去掉与标题重复的首个 H1。
+
+    自动沉淀的卡片常见「frontmatter title + 正文首行 H1 完全相同」的冗余，
+    标题已单独建索引，正文里再留一份纯属噪音。
+    """
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if line.strip().lstrip("#").strip() == title.strip():
+            return "\n".join(lines[i + 1 :]).strip()
+        return body
+    return body
+
+
+def _first_heading(body: str) -> str:
+    for line in body.split("\n"):
+        s = line.strip()
+        if s.startswith("#"):
+            return s.lstrip("#").strip()
+    return ""
+
+
+def build_card(vault: Path, path: Path) -> dict:
+    """把一个 Markdown 文件读成卡片字典。"""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    meta, body = parse_frontmatter(text)
+    rel = path.relative_to(vault).as_posix()
+
+    title = str(meta.get("title") or "").strip() or _first_heading(body) or path.stem
+    body = _strip_duplicate_heading(body, title)
+
+    tags = meta.get("tags", [])
+    if not isinstance(tags, list):
+        tags = [t.strip() for t in str(tags).split(",") if t.strip()]
+
+    return {
+        "rel_path": rel,
+        "title": title,
+        "kind": str(meta.get("kind", "")),
+        "status": str(meta.get("status", "")),
+        "source": str(meta.get("source") or meta.get("submittedBy") or ""),
+        "tags": tags,
+        "created": str(meta.get("created", "")),
+        "updated": str(meta.get("updated", "")),
+        "body": body,
+        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+    }
+
+
+def iter_markdown(vault: Path):
+    """遍历 vault 下的 Markdown 文件，跳过 .git。"""
+    for path in sorted(vault.rglob("*.md")):
+        if ".git" in path.parts:
+            continue
+        if path.is_file():
+            yield path
+
+
+def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> dict:
+    """把 vault 同步进索引。
+
+    返回各类计数：inserted / updated / unchanged / removed。
+    ``rebuild=True`` 会先清空索引再全量导入（Markdown 不受影响）。
+    """
+    vault = Path(vault)
+    if not vault.is_dir():
+        raise FileNotFoundError(f"vault 目录不存在：{vault}")
+
+    if rebuild:
+        conn.execute("DELETE FROM cards_fts")
+        conn.execute("DELETE FROM cards")
+        conn.commit()
+
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+    seen: set[str] = set()
+
+    for path in iter_markdown(vault):
+        card = build_card(vault, path)
+        seen.add(card["rel_path"])
+        counts[upsert_card(conn, card)] += 1
+
+    existing = {r["rel_path"] for r in conn.execute("SELECT rel_path FROM cards")}
+    counts["removed"] = delete_cards(conn, sorted(existing - seen))
+    conn.commit()
+    return counts

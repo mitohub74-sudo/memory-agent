@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 记忆数据绝不入库 —— 数据应放在 ~/.memory_agent，此处仅作兜底
+data/
+*.db
+*.db-wal
+*.db-shm

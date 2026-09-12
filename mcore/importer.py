@@ -200,10 +200,24 @@ def build_card(vault: Path, path: Path) -> dict:
     }
 
 
+# 扫描 vault 时要跳过的目录。
+#
+# ``.trash`` 是**软删的落点**：删除把卡片移到 ``<vault>/.trash/<原相对路径>``。
+# 它是 vault 的**子目录**，会被 ``rglob("*.md")`` 扫到 —— 不排除的话：
+#
+#   删除一张卡 → 文件移到 .trash → 下次索引又把它当成一张新卡扫进来
+#   → 卡片以新路径**复活**，而 `delete` 返回的是「成功」。
+#
+# 实测确认过（造一张 ``<vault>/.trash/.../被删的卡.md`` 后 ``importer.sync``
+# 把它索引了进去，inserted: 2）。所以这不是「顺手加的优化」，
+# 而是 `delete` 能成立的前置条件 —— 没有它，删除功能会静默失效。
+_SKIP_DIRS = frozenset({".git", ".trash"})
+
+
 def iter_markdown(vault: Path):
-    """遍历 vault 下的 Markdown 文件，跳过 .git。"""
+    """遍历 vault 下的 Markdown 文件，跳过 ``.git`` 与 ``.trash``。"""
     for path in sorted(vault.rglob("*.md")):
-        if ".git" in path.parts:
+        if _SKIP_DIRS & set(path.parts):
             continue
         if path.is_file():
             yield path

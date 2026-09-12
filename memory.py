@@ -383,8 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--json", action="store_true")
     pi.set_defaults(func=cmd_index)
 
-    ps = sub.add_parser("search", help="关键词检索")
-    ps.add_argument("query")
+    ps = sub.add_parser("search", help="关键词检索（传实体名/标识符，不要传整句问句）")
+    ps.add_argument("query", help="检索词：实体名、标识符、命令、路径片段。"
+                                  "整句问句会把匹配档位从 AND 精确降到 OR 放宽并引入噪音")
     ps.add_argument("-n", "--limit", type=int, default=10)
     ps.add_argument("--kind", help="按类型过滤")
     ps.add_argument("--source", help="按来源过滤")

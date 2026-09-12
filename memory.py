@@ -43,7 +43,7 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcore import capture, config, importer, mcp_server, search, store  # noqa: E402
+from mcore import capture, config, importer, mcp_server, readtext, search, store  # noqa: E402
 from mcore.version import __version__  # noqa: E402
 
 
@@ -219,6 +219,13 @@ def cmd_show(args) -> int:
     stat = store.get_access_stat(conn, row["rel_path"]) or {}
     conn.close()
 
+    # 长度窗口与 MCP 的 memory_get 共用同一份实现 —— 两个入口必须给出一致结果。
+    window = readtext.render_window(
+        row["body"],
+        offset=0 if args.full else args.offset,
+        max_chars=0 if args.full else args.max_chars,
+    )
+
     payload = {
         "ok": True,
         "id": row["id"],
@@ -231,13 +238,22 @@ def cmd_show(args) -> int:
         "updated": row["updated"],
         "access_count": stat.get("access_count", 1),
         "last_accessed": stat.get("last_accessed", 0),
-        "body": row["body"],
+        **window,
     }
-    _emit(
-        payload,
-        args.json,
-        lambda d: print(f"# {d['title']}\n{d['path']}\n\n{d['body']}"),
-    )
+
+    def render(d):
+        head = (f"# {d['title']}\n{d['path']}\n"
+                f"长度 {d['length']} 字符，本次返回 {d['returned']}"
+                f"（offset={d['offset']}）\n")
+        print(head)
+        print(d["text"])
+        if d["has_more"]:
+            # 截断必须说出来，并给出继续读的命令 —— 静默砍掉后半段就是假成功。
+            print(f"\n…（还有 {d['length'] - d['offset'] - d['returned']} 字符未显示，"
+                  f"继续读：memory.py show {d['id']} --offset {d['next_offset']}）",
+                  file=sys.stderr)
+
+    _emit(payload, args.json, render)
     return 0
 
 
@@ -372,6 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ph = sub.add_parser("show", help="查看卡片全文")
     ph.add_argument("id", type=int)
+    ph.add_argument("--offset", type=int, default=0,
+                    help="从第几个字符开始（长卡分页读，默认 0）")
+    ph.add_argument("--max-chars", type=int, default=readtext.DEFAULT_MAX_CHARS,
+                    help=f"本次最多返回多少字符（默认 {readtext.DEFAULT_MAX_CHARS}；0 表示不限）")
+    ph.add_argument("--full", action="store_true",
+                    help="返回完整正文（等价于 --max-chars 0）")
     ph.add_argument("--json", action="store_true")
     ph.set_defaults(func=cmd_show)
 

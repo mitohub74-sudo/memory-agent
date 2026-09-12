@@ -331,6 +331,54 @@ def main() -> int:
             except json.JSONDecodeError:
                 check("重复写入返回合法 JSON", False, t[:120])
 
+            # 长卡分片：长度上限必须真的生效，并把剩余量说清楚。
+            # 静默砍掉后半段再当全文返回，就是「能返回的假成功」。
+            long_title = "长卡分片测试"
+            long_body = "长卡正文段落内容。" * 100  # 900 字符
+            r = c2.request("tools/call", {"name": "memory_capture",
+                                          "arguments": {"title": long_title,
+                                                        "body": long_body}})
+            base2 = json.loads(r.get("result", {}).get("content", [{}])[0].get("text", "{}"))
+            check("长卡写入成功", base2.get("action") == "created", str(base2)[:120])
+
+            r = c2.request("tools/call", {"name": "memory_search",
+                                          "arguments": {"query": long_title}})
+            t = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            m = re.search(r"id=(\d+)", t)
+            if m is None:
+                check("能从检索结果解析出长卡 id", False, t[:150])
+            else:
+                long_id = int(m.group(1))
+                r = c2.request("tools/call", {"name": "memory_get",
+                                              "arguments": {"id": long_id, "max_chars": 60}})
+                piece = r.get("result", {}).get("content", [{}])[0].get("text", "")
+                check("长卡被截断并告知还有剩余", "未显示" in piece, piece[-200:])
+                check("长卡截断给出续读位置提示", "next_offset=" in piece, piece[-200:])
+
+                # 用提示里的 next_offset 续读，内容必须不同（真的读到了后续）。
+                # 刻意解析带名字的 next_offset= 而不是裸 offset= —— 头部那行也有
+                # 一个 offset=（本次窗口的起点），解析错了会「续读」到第一片，
+                # 而且看起来像是实现有问题。这个歧义在写测试时就真实踩到过。
+                m2 = re.search(r"next_offset=(\d+)", piece)
+                if m2 is None:
+                    check("截断提示里含可解析的 next_offset", False, piece[-200:])
+                else:
+                    r = c2.request("tools/call", {"name": "memory_get",
+                                                  "arguments": {"id": long_id,
+                                                                "offset": int(m2.group(1)),
+                                                                "max_chars": 60}})
+                    tail = r.get("result", {}).get("content", [{}])[0].get("text", "")
+                    check("按 next_offset 续读拿到不同内容",
+                          tail and tail[-80:] != piece[-80:], tail[-200:])
+
+                # full=true 时不再声称截断
+                r = c2.request("tools/call", {"name": "memory_get",
+                                              "arguments": {"id": long_id, "full": True}})
+                whole = r.get("result", {}).get("content", [{}])[0].get("text", "")
+                check("full=true 时不再报告剩余内容", "未显示" not in whole, whole[-200:])
+                check("full=true 时返回完整正文", long_body in whole.replace("\n", ""),
+                      str(len(whole)))
+
             # 过短正文应被拒绝
             r = c2.request("tools/call", {"name": "memory_capture",
                                           "arguments": {"title": "太短", "body": "嗯"}})
@@ -386,7 +434,7 @@ def main() -> int:
             files = list((Path(tmp) / "vault").rglob("*.md"))
             login = [f for f in files if "登录" in f.name]
             check("隔离 vault 里没有测试之外的文件",
-                  all("登录" in f.name or "撞车" in f.name for f in files),
+                  all(any(k in f.name for k in ("登录", "撞车", "长卡分片")) for f in files),
                   str([f.name for f in files]))
             check("中文标题保留在文件名中", len(login) == 1,
                   str([f.name for f in files]))

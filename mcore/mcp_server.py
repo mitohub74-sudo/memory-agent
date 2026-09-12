@@ -25,7 +25,7 @@ import json
 import sys
 from typing import Any
 
-from . import capture, config, importer, search, store
+from . import capture, config, importer, readtext, search, store
 from .version import __version__ as SERVER_VERSION
 
 __all__ = ["SUPPORTED_PROTOCOL_VERSIONS", "DEFAULT_PROTOCOL_VERSION", "TOOLS", "serve"]
@@ -80,11 +80,29 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "读取某张知识卡的完整内容。先用 memory_search 拿到 id，再调用本工具展开全文。"
             "检索结果里的摘要被截断时使用。"
+            "长卡会按长度上限分片返回：结果末尾会写明还有多少字符未显示，"
+            "并按需给出继续读用的 offset —— 看到「还有 N 字符未显示」时，"
+            "若那部分对你有用，就用返回的 offset 再调一次。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "number", "description": "卡片 id，来自 memory_search 结果"},
+                "offset": {
+                    "type": "number",
+                    "description": "从第几个字符开始读，默认 0。分片续读时用上一次返回的 offset",
+                },
+                "max_chars": {
+                    "type": "number",
+                    "description": (
+                        f"本次最多返回多少字符，默认 {readtext.DEFAULT_MAX_CHARS}；"
+                        "0 表示不限长（等于取全文，长卡慎用）"
+                    ),
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": "true 则不分片，直接返回完整正文（长卡会占用大量上下文）",
+                },
             },
             "required": ["id"],
         },
@@ -181,6 +199,22 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _num(value, default: int) -> int:
+    """把工具参数转成 int，**保留显式的 0**。
+
+    不能写 ``args.get(x) or default``：``offset=0`` 与 ``max_chars=0`` 都是
+    **有意义的值**（0 表示从头读 / 不限长），而它们在布尔上下文里是假值，
+    会被 ``or`` 悄悄换成默认值。这个坑实测踩过一次 —— 表现为「续读永远拿回
+    第一片」，而且不报错。
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class MemoryServer:
     """工具实现。连接惰性打开，跨调用复用。"""
 
@@ -258,15 +292,38 @@ class MemoryServer:
         stat = store.get_access_stat(self.conn, row["rel_path"]) or {}
         access_count = stat.get("access_count", 1)
 
+        # 与 CLI 的 show 共用同一份窗口实现 —— 两个入口必须给出一致结果。
+        # 注意用 _num 而不是 `or`：offset=0 与 max_chars=0 都是有意义的值。
+        if args.get("full"):
+            window = readtext.render_window(row["body"], offset=0, max_chars=0)
+        else:
+            window = readtext.render_window(
+                row["body"],
+                offset=_num(args.get("offset"), 0),
+                max_chars=_num(args.get("max_chars"), readtext.DEFAULT_MAX_CHARS),
+            )
+
         head = (
             f"# {row['title']}\n"
             f"路径：{row['rel_path']}\n"
             f"类型：{row['kind']}　来源：{row['source']}　状态：{row['status']}\n"
             f"标签：{row['tags']}\n"
             f"更新：{row['updated']}　读取次数：{access_count}\n"
+            f"长度：{window['length']} 字符，本次返回 {window['returned']}"
+            f"（offset={window['offset']}）\n"
             f"{'-' * 60}\n"
         )
-        return _ok(head + row["body"])
+        text = head + window["text"]
+        if window["has_more"]:
+            # 截断必须显式说明并给出续读位置。悄悄砍掉后半段、当成全文返回，
+            # 就是「能返回的假成功」—— 调用方会以为卡片就这么短。
+            remaining = window["length"] - window["offset"] - window["returned"]
+            # 用 ``next_offset=N`` 这种带名字的写法，而不是裸 ``offset=N`` ：
+            # 头部那行也有一个 offset=，裸写法会让调用方（和人）解析到错的那个。
+            text += (f"\n\n…（还有 {remaining} 字符未显示。"
+                     f"续读请再调用 memory_get(id={row['id']}, "
+                     f"next_offset={window['next_offset']})）")
+        return _ok(text)
 
     def memory_capture(self, args: dict) -> dict:
         title = str(args.get("title") or "").strip()

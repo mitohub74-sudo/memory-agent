@@ -105,11 +105,31 @@ python memory.py index [--rebuild]    # 同步 / 重建索引
 python memory.py search <query>       # 检索
 python memory.py capture --title T --body B   # 写入一张卡片
 python memory.py stats                # 统计
-python memory.py show <id>            # 卡片全文
+python memory.py show <id>            # 卡片全文（长卡默认分片，见下）
 python memory.py mcp                  # 启动 MCP server
 ```
 
-所有命令支持 `--json`。退出码：`0` 成功，`1` 无结果，`2` 环境错误。
+所有命令支持 `--json`。退出码：`0` 成功，`1` 无结果，`2` 环境错误，
+`3` 标题撞车被拒绝（`--on-conflict reject`）。
+
+### 长卡分片读取
+
+卡片会长（蒸馏出来的会话卡常有数千字符），所以取全文的**默认带长度上限**：
+
+```bash
+python memory.py show 8                      # 默认最多 20000 字符
+python memory.py show 8 --offset 20000       # 续读下一页
+python memory.py show 8 --max-chars 500      # 自定义窗口
+python memory.py show 8 --full               # 不分片，返回完整正文
+```
+
+返回值里有 `offset` / `length` / `returned` / `has_more` / `next_offset`，
+文本末尾会写明「还有 N 字符未显示」以及续读要用的 `next_offset`。
+
+**截断永远显式**：宁可多一行提示，也不静默砍掉后半段再当成全文返回 ——
+那会让调用方以为卡片就这么短。MCP 的 `memory_get` 参数与语义完全一致
+（`offset` / `max_chars` / `full`），两个入口共用 `mcore/readtext.py` 一份实现。
+`max_chars=0` 等价于 `--full`。
 
 `search -n` 的取值范围是 `[1, 20]`，越界会被钳制 —— SQLite 的 `LIMIT -1` 表示**无上限**，
 不钳制就会把整张表倒出来。
@@ -191,7 +211,7 @@ stdio 传输，每行一条 JSON-RPC 2.0 消息。协议版本 `2025-06-18` / `2
 | 工具 | 用途 |
 |---|---|
 | `memory_search` | 检索记忆，返回摘要 + id。参数 `query` `limit`（上限 20）`kind` `source` |
-| `memory_get` | 用 id 取卡片全文 |
+| `memory_get` | 用 id 取卡片全文（长卡分片返回，见下） |
 | `memory_capture` | **写入**一条知识并立即索引本卡。参数 `title` `body` `kind` `tags` |
 | `memory_stats` | 库概览（总数、类型/来源分布、最近更新） |
 | `memory_reindex` | 手动补建索引（增量或 `rebuild` 全量）。正常写入已自动索引，此工具用于索引丢失或外部改动后补建 |

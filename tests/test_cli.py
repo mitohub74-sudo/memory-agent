@@ -128,6 +128,63 @@ def test_cli_capture_reports_title_collision() -> None:
         assert after == before, f"reject 不该产生新文件：{after}"
 
 
+def test_cli_show_pages_long_cards() -> None:
+    """CLI 端到端：长卡必须分片，并能用 offset 续读到全文。
+
+    store 层与 readtext 都已单独测过；这里再走真实命令行，因为「窗口实现对了、
+    CLI 忘了接上去」是典型分叉 —— 那种情况下 CLI 会继续把全文一次吐出来，
+    而所有单测都是绿的。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-cli-") as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        (vault / "03-Knowledge").mkdir(parents=True)
+        long_body = "长卡正文段落。" * 300  # 2100 字符
+        (vault / "03-Knowledge" / "长卡.md").write_text(
+            "---\ntitle: 长卡\nkind: knowledge\n---\n\n" + long_body + "\n",
+            encoding="utf-8",
+        )
+        env = {
+            "MEMORY_AGENT_VAULT": str(vault),
+            "MEMORY_AGENT_DB": str(root / "memory.db"),
+        }
+        assert _run(env, "index", "--json").returncode == 0
+
+        # 小窗口：应截断并给出续读位置
+        r = _run(env, "show", "1", "--max-chars", "100", "--json")
+        assert r.returncode == 0, r.stderr
+        first = json.loads(r.stdout)
+        assert first["offset"] == 0
+        assert first["returned"] == 100, first
+        assert first["has_more"] is True, first
+        assert first["truncated"] is True, first
+        assert first["next_offset"] == 100, first
+        assert first["length"] > 2000, first
+
+        # 用返回的 next_offset 续读
+        r = _run(env, "show", "1", "--offset", str(first["next_offset"]),
+                 "--max-chars", "100", "--json")
+        assert r.returncode == 0, r.stderr
+        second = json.loads(r.stdout)
+        assert second["offset"] == 100
+        assert second["returned"] == 100
+        assert second["text"] != first["text"], "续读应拿到后续内容"
+
+        # 首尾两片必须能在原文里对上（证明没跳字、没错位）
+        merged = (first["text"] + second["text"]).replace("\n", "")
+        assert merged in long_body.replace("\n", ""), "分片内容必须在原文中连续出现"
+
+        # --full 必须一次给全，且不再声称有后续
+        r = _run(env, "show", "1", "--full", "--json")
+        assert r.returncode == 0, r.stderr
+        whole = json.loads(r.stdout)
+        assert whole["has_more"] is False, whole
+        assert whole["truncated"] is False, whole
+        assert whole["next_offset"] is None, whole
+        assert "长卡正文段落。" in whole["text"]
+        assert whole["returned"] == whole["length"], whole
+
+
 def test_access_stats_survive_index_rebuild_via_cli() -> None:
     """``index --rebuild`` 之后访问统计必须还在。
 

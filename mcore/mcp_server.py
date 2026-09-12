@@ -501,82 +501,104 @@ def _force_utf8_streams() -> None:
 
 
 def serve() -> int:
-    """stdio 主循环。"""
+    """stdio 主循环。
+
+    **客户端提前关掉管道是正常收场，不是错误。** 编辑器 / agent 宿主随时可能
+    在会话结束后关闭 stdin/stdout；此时写响应会抛 ``BrokenPipeError``，
+    读循环也会拿到 EOF 或同样的异常。原来的写法会让服务在退出时打出一整段
+    Python 栈 —— 栈本身没什么害处，但宿主通常把 stderr 当错误信号，
+    于是「用户正常关掉了窗口」被记成一次服务崩溃，真正的问题反而被淹没。
+
+    所以这两类情况都当作正常结束，退出码 0。
+    """
     _force_utf8_streams()
     server = MemoryServer()
     write = sys.stdout.write
     flush = sys.stdout.flush
 
+    class _ClientGone(Exception):
+        """客户端已关闭管道 —— 内部信号，用来跳出循环，不是错误。"""
+
     def send(msg: dict) -> None:
-        write(json.dumps(msg, ensure_ascii=False) + "\n")
-        flush()
+        try:
+            write(json.dumps(msg, ensure_ascii=False) + "\n")
+            flush()
+        except (BrokenPipeError, ValueError, OSError) as exc:
+            # ValueError/OSError 覆盖「写到已关闭的文本流」在 CPython 上的各种表现
+            # （底层是 EBADF 或 "I/O operation on closed file"）。
+            raise _ClientGone() from exc
 
     _log(f"ready  db={config.db_path()}  vault={config.vault_path()}")
 
-    for raw in sys.stdin:
-        line = raw.strip()
-        if not line:
-            continue
-
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            send({"jsonrpc": "2.0", "id": None,
-                  "error": {"code": PARSE_ERROR, "message": "Parse error"}})
-            continue
-
-        if not isinstance(msg, dict):
-            send({"jsonrpc": "2.0", "id": None,
-                  "error": {"code": INVALID_REQUEST, "message": "Invalid Request"}})
-            continue
-
-        msg_id = msg.get("id")
-        method = msg.get("method")
-        params = msg.get("params") or {}
-
-        # notification（无 id）不回包
-        if msg_id is None:
-            continue
-
-        if method == "initialize":
-            requested = str(params.get("protocolVersion") or "")
-            negotiated = (
-                requested if requested in SUPPORTED_PROTOCOL_VERSIONS
-                else DEFAULT_PROTOCOL_VERSION
-            )
-            # 记录客户端身份，供 memory_capture 署名
-            info = params.get("clientInfo") or {}
-            name = str(info.get("name") or "").strip()
-            ver = str(info.get("version") or "").strip()
-            if name:
-                server.client_name = f"{name}@{ver}" if ver else name
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {
-                "protocolVersion": negotiated,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            }})
-
-        elif method == "ping":
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
-
-        elif method == "tools/call":
-            name = str(params.get("name") or "")
-            args = params.get("arguments") or {}
-            if not isinstance(args, dict):
-                send({"jsonrpc": "2.0", "id": msg_id,
-                      "error": {"code": INVALID_PARAMS,
-                                "message": "arguments must be an object"}})
+    try:
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
                 continue
-            send({"jsonrpc": "2.0", "id": msg_id,
-                  "result": server.call(name, args)})
 
-        else:
-            send({"jsonrpc": "2.0", "id": msg_id,
-                  "error": {"code": METHOD_NOT_FOUND,
-                            "message": f"Method not found: {method}"}})
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                send({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": PARSE_ERROR, "message": "Parse error"}})
+                continue
+
+            if not isinstance(msg, dict):
+                send({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": INVALID_REQUEST, "message": "Invalid Request"}})
+                continue
+
+            msg_id = msg.get("id")
+            method = msg.get("method")
+            params = msg.get("params") or {}
+
+            # notification（无 id）不回包
+            if msg_id is None:
+                continue
+
+            if method == "initialize":
+                requested = str(params.get("protocolVersion") or "")
+                negotiated = (
+                    requested if requested in SUPPORTED_PROTOCOL_VERSIONS
+                    else DEFAULT_PROTOCOL_VERSION
+                )
+                # 记录客户端身份，供 memory_capture 署名
+                info = params.get("clientInfo") or {}
+                name = str(info.get("name") or "").strip()
+                ver = str(info.get("version") or "").strip()
+                if name:
+                    server.client_name = f"{name}@{ver}" if ver else name
+                send({"jsonrpc": "2.0", "id": msg_id, "result": {
+                    "protocolVersion": negotiated,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                }})
+
+            elif method == "ping":
+                send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+
+            elif method == "tools/list":
+                send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
+
+            elif method == "tools/call":
+                name = str(params.get("name") or "")
+                args = params.get("arguments") or {}
+                if not isinstance(args, dict):
+                    send({"jsonrpc": "2.0", "id": msg_id,
+                          "error": {"code": INVALID_PARAMS,
+                                    "message": "arguments must be an object"}})
+                    continue
+                send({"jsonrpc": "2.0", "id": msg_id,
+                      "result": server.call(name, args)})
+
+            else:
+                send({"jsonrpc": "2.0", "id": msg_id,
+                      "error": {"code": METHOD_NOT_FOUND,
+                                "message": f"Method not found: {method}"}})
+
+    except _ClientGone:
+        _log("client closed the pipe, exiting")
+        return 0
 
     _log("stdin closed, exiting")
     return 0

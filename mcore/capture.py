@@ -117,21 +117,69 @@ def _secret_warnings(findings: list[dict]) -> list[str]:
 _UNSAFE = re.compile(r"[^\w\u4e00-\u9fff-]+", re.UNICODE)
 _DASHES = re.compile(r"-{2,}")
 
+# Windows 保留设备名。**不能用作文件名的词干** —— 在这些名字后面加扩展名也不行：
+# ``CON.md`` 在 Windows 上依然打不开，因为设备名是在遇到 ``.`` 之前就已经匹配完了。
+#
+# 项目要跨平台，而这些卡片文件名直接由标题生成，用户完全可能写一张
+# 标题为「NUL」「COM1」「con」的卡 —— 那时落盘会失败或产生一个打不开的文件，
+# 而且失败发生在**写入阶段**，离「标题起得不对」这个真正原因很远。
+_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+# 保留名清单本身就是判定依据，不再需要额外的正则。
+
+
+
+def _avoid_reserved(slug: str) -> str:
+    """slug 若是 Windows 保留设备名，包一层下划线把它变成普通名字。
+
+    ``con`` → ``_con_``；``my-con`` → ``my-_con_``。
+
+    为什么用「包裹」而不是「加前缀」：加前缀会把 ``my-con`` 变成 ``xmy-con``，
+    读起来像另一个词；包裹保持可读性，且一眼能看出这里被人为改动过。
+
+    只判**整段**是不是保留名（不判「以保留名结尾」）：
+    真正会出问题的是文件名的词干，而 ``my-con.md`` 的词干是 ``my-con``，
+    它不是设备名 —— 把它改掉只会让用户莫名其妙。判定放在 ``slugify`` 的最后，
+    因为保留名可能是截断或去连字符之后才浮现的（超长标题截断后末尾恰好是 ``con``）。
+    """
+    if slug.upper() in _RESERVED_NAMES:
+        return f"_{slug}_"
+    return slug
+
 
 def slugify(title: str) -> str:
-    """把标题转成安全的文件名片段。中文原样保留。"""
+    """把标题转成安全的文件名片段。中文原样保留。
+
+    最后一步处理 **Windows 保留设备名**（``CON`` / ``NUL`` / ``COM1``…）：
+    它们在 Windows 上无法作为文件名，而卡片标题完全可能就叫「NUL」。
+    判定必须在截断与去连字符**之后**做 —— 保留名可能是前几步才浮现的。
+    """
     s = (title or "").strip().lower()
     s = _UNSAFE.sub("-", s)
     s = _DASHES.sub("-", s).strip("-")
     if len(s) > MAX_SLUG_CHARS:
         s = s[:MAX_SLUG_CHARS].rstrip("-")
-    return s or "untitled"
+    s = _avoid_reserved(s or "untitled")
+    return s
 
 
 def _now_iso() -> str:
-    """与既有卡片一致的 ISO 时间戳（毫秒 + Z）。"""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    """与既有卡片一致的 ISO 时间戳（毫秒 + Z）。
+
+    **只取一次 ``now()``**。原实现调了两次（秒用一次、毫秒用一次），
+    两次之间可能跨过整秒边界 —— 于是会出现 ``...:59.000Z`` 这种自相矛盾的时间戳：
+    秒还是 59，而毫秒已经取了下一秒的 000。概率极低但确实会发生，
+    而时间戳是卡片排序与「最近更新」的依据，错了不会报错、只会让顺序变得诡异。
+
+    ``datetime`` 是导入的对象（不是模块），所以这里没法用 frozen-time 之类的
+    库来测；测试改为断言「毫秒与秒来自同一时刻」的实现形态（见 tests）。
+    """
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 def _yaml_list(items: list[str]) -> str:

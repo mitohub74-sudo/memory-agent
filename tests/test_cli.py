@@ -79,6 +79,55 @@ def test_cli_capture_reads_utf8_body_from_stdin() -> None:
         assert r.returncode == 0, f"写入后应立刻可检索：{r.stdout} {r.stderr}"
 
 
+def test_cli_capture_reports_title_collision() -> None:
+    """CLI 端到端：标题撞车必须显式报出，且 reject 策略下不动盘。
+
+    单元测试已覆盖 capture 层；这里再走一遍真实命令行，因为「store/capture 层对、
+    CLI 层忘了传参数或吞掉返回值」是典型的分叉 —— 两层各自都「绿」，产品却是坏的。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-cli-") as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        env = {
+            "MEMORY_AGENT_VAULT": str(vault),
+            "MEMORY_AGENT_DB": str(root / "memory.db"),
+        }
+        title = "CLI撞车卡"
+        first_body = "第一版正文，描述当前部署方式，长度足够建卡。"
+        second_body = "第二版正文，部署方式已改变，与第一版不同。"
+
+        # 首次写入：不该有冲突
+        r = _run(env, "capture", "--title", title, "--body", first_body, "--json")
+        assert r.returncode == 0, r.stderr
+        first = json.loads(r.stdout)
+        assert first["action"] == "created"
+        assert "conflict" not in first, first
+
+        # 同标题不同正文：默认另存，但必须回传冲突信息
+        r = _run(env, "capture", "--title", title, "--body", second_body, "--json")
+        assert r.returncode == 0, r.stderr
+        second = json.loads(r.stdout)
+        assert second.get("conflict") is True, second
+        assert second["existing_path"] == first["path"], second
+        assert second["collision_count"] == 1, second
+        assert Path(second["path"]).name == "cli撞车卡-2.md", second
+
+        # reject 策略：退出码 3（撞车是明确拒绝，不同于参数不合法的 1），且不写盘。
+        # 正文必须 ≥ MIN_BODY_CHARS，否则会先被「正文过短」拦下（退出码 1）——
+        # 长度校验在冲突检测之前，这里刻意给足长度，保证测的是撞车而不是长度。
+        before = sorted(p.name for p in (vault / "03-Knowledge").glob("*.md"))
+        r = _run(env, "capture", "--title", title,
+                 "--body", "第三版正文，内容和前两版都不一样，用来验证拒绝策略。",
+                 "--on-conflict", "reject", "--json")
+        assert r.returncode == 3, f"撞车应以退出码 3 结束：{r.returncode} {r.stdout} {r.stderr}"
+        rejected = json.loads(r.stdout)
+        assert rejected["action"] == "conflict", rejected
+        assert rejected["existing_path"] == first["path"], rejected
+
+        after = sorted(p.name for p in (vault / "03-Knowledge").glob("*.md"))
+        assert after == before, f"reject 不该产生新文件：{after}"
+
+
 def test_access_stats_survive_index_rebuild_via_cli() -> None:
     """``index --rebuild`` 之后访问统计必须还在。
 

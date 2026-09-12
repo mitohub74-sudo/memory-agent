@@ -262,9 +262,16 @@ def cmd_capture(args) -> int:
         kind=args.kind,
         tags=tags,
         source=args.source,
+        on_conflict=args.on_conflict,
     )
 
     if not result["ok"]:
+        # 撞车是「明确的拒绝」，与「参数不合法」要分开报：
+        # 前者调用方改个标题或换策略就能过，后者得改参数。
+        if result.get("action") == "conflict":
+            _emit(result, args.json,
+                  lambda d: print(f"标题撞车：{d['reason']}", file=sys.stderr))
+            return 3
         _emit(result, args.json, lambda d: print(f"拒绝：{d['reason']}", file=sys.stderr))
         return 1
 
@@ -387,6 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "content / business / system（默认 knowledge）")
     pc.add_argument("--tags", help="标签，逗号分隔")
     pc.add_argument("--source", default="agent", help="来源标记，默认 agent")
+    pc.add_argument("--on-conflict", choices=capture.CONFLICT_POLICIES,
+                    default="suffix",
+                    help="标题撞车（同标题不同正文）时的处理："
+                         "suffix=另存为 -2 新卡并回传冲突信息（默认）；reject=拒绝写入")
     pc.add_argument("--vault", help="vault 目录")
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_capture)

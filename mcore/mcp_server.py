@@ -126,6 +126,16 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "可选来源标记，默认取调用方 clientInfo",
                 },
+                "on_conflict": {
+                    "type": "string",
+                    "enum": ["suffix", "reject"],
+                    "description": (
+                        "标题已存在但正文不同时的处理。"
+                        "suffix（默认）另存为 -2 新卡并在结果里回传 conflict 信息；"
+                        "reject 直接拒绝写入。"
+                        "若你要表达「事实变了」，不要靠这个参数 —— 用取代语义。"
+                    ),
+                },
             },
             "required": ["title", "body"],
         },
@@ -276,6 +286,7 @@ class MemoryServer:
             kind=str(args.get("kind") or "knowledge"),
             tags=[str(t) for t in tags],
             source=str(args.get("source") or self.client_name),
+            on_conflict=str(args.get("on_conflict") or "suffix"),
         )
 
         if not result["ok"]:
@@ -308,6 +319,17 @@ class MemoryServer:
             "indexed": indexed,
             "note": note,
         }
+        # 标题撞车必须显式回传：否则调用方只看到「写好了」，却不知道
+        # 库里多了一张同标题的卡，以后检索会同时命中两张而无法判断该信哪张。
+        if result.get("conflict"):
+            payload["conflict"] = True
+            payload["existing_path"] = result.get("existing_path", "")
+            payload["collision_count"] = result.get("collision_count", 0)
+            payload["collision_paths"] = result.get("collision_paths", [])
+            payload["suggestion"] = (
+                "同标题但内容不同的卡片已存在。若这是对既有事实的修正，"
+                "请改用更新；若事实已变而旧值仍需留存，请改用取代。"
+            )
         if warning:
             payload["warning"] = warning
         return _ok(json.dumps(payload, ensure_ascii=False, indent=2))

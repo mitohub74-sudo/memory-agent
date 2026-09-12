@@ -337,6 +337,41 @@ def main() -> int:
             check("过短正文被拒绝",
                   r.get("result", {}).get("isError") is True, str(r)[:120])
 
+            # 标题撞车：同标题不同正文必须**显式回传**，不能静默多出一张卡。
+            # 默认策略仍是另存（兼容），所以 action 还是 created —— 但结果里
+            # 必须能看出「我和谁撞了」，否则调用方不知道库里有了两张同标题卡。
+            conflict_title = "撞车卡：部署方式"
+            base = c2.request("tools/call", {"name": "memory_capture",
+                                             "arguments": {"title": conflict_title,
+                                                           "body": "部署方式为 A，端口 8080，说明足够长。"}})
+            base_out = json.loads(base.get("result", {}).get("content", [{}])[0].get("text", "{}"))
+
+            r = c2.request("tools/call", {"name": "memory_capture",
+                                          "arguments": {"title": conflict_title,
+                                                        "body": "部署方式已改为 B，端口换成了 9090。"}})
+            t = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            try:
+                out = json.loads(t)
+                check("撞车时 action 仍为 created（兼容默认另存）",
+                      out.get("action") == "created", str(out))
+                check("撞车被显式回传 conflict=true", out.get("conflict") is True, str(out))
+                check("撞车回传 existing_path 指向基名卡",
+                      out.get("existing_path") == base_out.get("path"), str(out))
+                check("撞车回传碰撞数量与清单",
+                      out.get("collision_count") == 1 and len(out.get("collision_paths", [])) == 1,
+                      str(out))
+                check("撞车给出后续动作建议", bool(out.get("suggestion")), str(out))
+            except json.JSONDecodeError:
+                check("撞车返回合法 JSON", False, t[:120])
+
+            # reject 策略：不写盘，且能拿到出口信息
+            r = c2.request("tools/call", {"name": "memory_capture",
+                                          "arguments": {"title": conflict_title,
+                                                        "body": "第三种正文，标题相同但内容又不同。",
+                                                        "on_conflict": "reject"}})
+            check("reject 策略下写入被拒绝",
+                  r.get("result", {}).get("isError") is True, str(r)[:160])
+
             # 关键：**不调 memory_reindex**，写入后直接检索。
             # 若 capture 没有真正建索引，这里就会搜不到 —— 这正是要防的「假成功」。
             r = c2.request("tools/call", {"name": "memory_search",
@@ -345,13 +380,18 @@ def main() -> int:
             check("capture 后不调 reindex 也能检索到",
                   "命中 1" in t or "命中 2" in t, t[:150])
 
-            # 中文标题应生成可读文件名
+            # 中文标题应生成可读文件名。
+            # 注意文件数不是断言重点 —— 重点是这个隔离 vault 里**只有本测试写的东西**，
+            # 所以按内容断言而不是按总数（撞车测试会合法地多出卡片）。
             files = list((Path(tmp) / "vault").rglob("*.md"))
-            check("落盘 1 个卡片文件", len(files) == 1, str([f.name for f in files]))
+            login = [f for f in files if "登录" in f.name]
+            check("隔离 vault 里没有测试之外的文件",
+                  all("登录" in f.name or "撞车" in f.name for f in files),
+                  str([f.name for f in files]))
+            check("中文标题保留在文件名中", len(login) == 1,
+                  str([f.name for f in files]))
             check("归入 03-Knowledge 目录",
-                  files and "03-Knowledge" in str(files[0]), str(files))
-            check("中文标题保留在文件名中",
-                  files and "登录" in files[0].name, files[0].name if files else "")
+                  bool(login) and "03-Knowledge" in str(login[0]), str(files))
         finally:
             c2.close()
             shutil.rmtree(tmp, ignore_errors=True)

@@ -242,12 +242,18 @@ class MemoryServer:
         if row is None:
             return _err(f"找不到 id={card_id} 的卡片。")
 
+        # 取全文才算「读过」。检索列表里出现不算 —— 那只说明它被召回，
+        # 不代表内容被用上；把召回算成访问会让统计失去区分度。
+        store.record_access(self.conn, row["rel_path"])
+        stat = store.get_access_stat(self.conn, row["rel_path"]) or {}
+        access_count = stat.get("access_count", 1)
+
         head = (
             f"# {row['title']}\n"
             f"路径：{row['rel_path']}\n"
             f"类型：{row['kind']}　来源：{row['source']}　状态：{row['status']}\n"
             f"标签：{row['tags']}\n"
-            f"更新：{row['updated']}\n"
+            f"更新：{row['updated']}　读取次数：{access_count}\n"
             f"{'-' * 60}\n"
         )
         return _ok(head + row["body"])
@@ -317,6 +323,10 @@ class MemoryServer:
             "by_source": dict(s["by_source"]),
             "by_status": dict(s["by_status"]),
             "recent": [{"path": p, "updated": u} for p, u in s["latest"]],
+            # 访问统计来自独立表，index --rebuild 不会清它。
+            # 注意口径：它记的是「被 memory_get 取过全文的次数」，
+            # 不是「被写入的次数」，也不是「被检索召回的次数」。
+            "most_accessed": store.access_stats(self.conn, limit=5),
             "db": str(config.db_path()),
             "vault": str(config.vault_path()),
         }

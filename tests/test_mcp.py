@@ -257,6 +257,8 @@ def main() -> int:
             check("卡片数等于合成语料规模",
                   stats.get("total") == len(CORPUS_CARDS),
                   f"{stats.get('total')} vs {len(CORPUS_CARDS)}")
+            # 访问统计在独立表里，且口径是「取过全文」而不是「被召回」
+            check("stats 含 most_accessed 字段", "most_accessed" in stats, str(stats)[:120])
         except json.JSONDecodeError:
             check("stats 返回合法 JSON", False, t6[:120])
 

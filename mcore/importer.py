@@ -11,7 +11,10 @@ frontmatter 解析刻意不引入 PyYAML —— 只支持本项目实际用到�
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
+import time
+from datetime import datetime
 from pathlib import Path
 
 from .store import delete_cards, upsert_card
@@ -80,6 +83,58 @@ def _first_heading(body: str) -> str:
     return ""
 
 
+def _parse_priority(raw) -> int:
+    """解析 frontmatter 的 priority。非法值退回 0，不抛错。
+
+    索引端的职责是如实投影真相源，不是校验它。一张卡写了
+    ``priority: 高`` 只该被当作「没设优先级」，而不是让整个 vault 同步失败 ——
+    为了一个排序提示词让 49 张卡都索引不进去，代价完全不成比例。
+    """
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_ttl(raw) -> int:
+    """解析 frontmatter 的 ttl，返回**过期时刻**（unix 秒）。``0`` 表示永不过期。
+
+    支持两种写法：
+
+    - 时长：``30d`` / ``12h`` / ``45m``（d/h/m 后缀，可组合如 ``1d12h``）
+    - 绝对时刻：``2026-10-01`` 或 ``2026-10-01T12:00:00``
+
+    相对时长从**现在**起算，不绑定卡片时间戳 —— 卡片被编辑时 ttl 语义就是
+    「从这次编辑起再活 X」，用 created 起算会让改一次就立即过期。
+    """
+    if raw is None:
+        return 0
+    text = str(raw).strip().strip("'\"")
+    if not text or text.lower() in ("none", "never", "-"):
+        return 0
+
+    # 绝对时刻
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(text, fmt).timestamp())
+        except ValueError:
+            continue
+
+    # 相对时长：1d12h30m（整串只允许数字与 d/h/m，别的一律不认）
+    compact = re.sub(r"\s+", "", text.lower())
+    parts = re.findall(r"(\d+)([dhm])", compact)
+    if not parts or "".join(f"{n}{u}" for n, u in parts) != compact:
+        return 0
+    seconds = 0
+    for value, unit in parts:
+        seconds += int(value) * {"d": 86400, "h": 3600, "m": 60}[unit]
+    return int(time.time()) + seconds if seconds else 0
+
+
 def build_card(vault: Path, path: Path) -> dict:
     """把一个 Markdown 文件读成卡片字典。"""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -93,6 +148,8 @@ def build_card(vault: Path, path: Path) -> dict:
     if not isinstance(tags, list):
         tags = [t.strip() for t in str(tags).split(",") if t.strip()]
 
+    ttl_raw = str(meta.get("ttl", "") or "")
+
     return {
         "rel_path": rel,
         "title": title,
@@ -102,6 +159,11 @@ def build_card(vault: Path, path: Path) -> dict:
         "tags": tags,
         "created": str(meta.get("created", "")),
         "updated": str(meta.get("updated", "")),
+        # priority / ttl 放在 frontmatter（真相源），不放索引：
+        # 索引是可重建的，放索引里的字段重建即丢。
+        "priority": _parse_priority(meta.get("priority", 0)),
+        "ttl": ttl_raw,
+        "expires_at": _parse_ttl(ttl_raw),
         "body": body,
         # file_hash = 整份文件文本（含 frontmatter）的哈希，用于增量比对。
         # 与 capture 的 card_fingerprint（标题+正文）是两个不同的东西，
@@ -129,6 +191,11 @@ def sync_one(
 
     这是**唯一**的单文件索引入口 —— 全量 :func:`sync` 与采集端都走这里。
 
+    本函数自己保证 schema 就位（``store.init``），不依赖调用方记得先初始化。
+    顺序需要说明一下：``sync(rebuild=True)`` 会先清表，然后才逐个调本函数，
+    ``init`` 里最后那遍 DDL 全是 ``IF NOT EXISTS``，所以不会把刚清空的表又「补」出内容。
+    这样安排之后，任何写入路径都不会在缺表 / 缺列的库上跑到一半才报错。
+
     为什么要强调唯一：两处各写一套「建卡 + 写库」逻辑，迟早会在解析细节上分叉
     （某一边先支持了新字段、某一边忘了处理 BOM）。分叉是**静默**的 ——
     同一张卡在两条路径下得到不同结果，索引里出现 Markdown 中不存在的状态，
@@ -136,6 +203,9 @@ def sync_one(
 
     ``card`` 可传入已构建好的卡片字典，供全量同步复用，避免重复读文件。
     """
+    from .store import init as store_init
+
+    store_init(conn)
     if card is None:
         card = build_card(Path(vault), Path(path))
     return upsert_card(conn, card)
@@ -146,6 +216,11 @@ def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> 
 
     返回各类计数：inserted / updated / unchanged / removed。
     ``rebuild=True`` 会先清空索引再全量导入（Markdown 不受影响）。
+
+    **``rebuild`` 不清 ``card_stats``** —— 访问统计不是从 vault 推导出来的投影，
+    它没有别的来源；跟着 cards 一起清掉就是不可恢复的丢失。清掉「可重建的」、
+    留下「不可重建的」，这条界线的依据是**能否从真相源重新算出来**，
+    不是「表名像不像索引」。
 
     每个文件都经由 :func:`sync_one` 落库 —— 全量同步只是「遍历 + 逐个 sync_one」，
     不另起一条写入路径。

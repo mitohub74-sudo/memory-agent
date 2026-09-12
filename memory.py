@@ -163,9 +163,18 @@ def cmd_stats(args) -> int:
 
     conn = store.connect(db)
     s = store.stats(conn)
+    accessed = store.access_stats(conn, limit=5)
     conn.close()
 
-    payload = {"ok": True, "db": str(db), "db_bytes": db.stat().st_size, **s}
+    payload = {
+        "ok": True,
+        "db": str(db),
+        "db_bytes": db.stat().st_size,
+        **s,
+        # 访问统计在独立表里，index --rebuild 不会清它。
+        # 口径：被 show/get 取过全文的次数，不含「仅被检索召回」。
+        "most_accessed": accessed,
+    }
 
     def render(d):
         print(f"{d['db']}  {d['db_bytes'] / 1024:.1f} KB")
@@ -173,6 +182,10 @@ def cmd_stats(args) -> int:
         for label, key in (("kind", "by_kind"), ("source", "by_source"), ("status", "by_status")):
             for name, n in d[key]:
                 print(f"  {label}:{name} {n}")
+        if d["most_accessed"]:
+            print("读取最多：")
+            for item in d["most_accessed"]:
+                print(f"  {item['access_count']:>3}×  {item['rel_path']}")
 
     _emit(payload, args.json, render)
     return 0
@@ -187,12 +200,18 @@ def cmd_show(args) -> int:
 
     conn = store.connect(db)
     row = store.get_card(conn, args.id)
-    conn.close()
 
     if row is None:
+        conn.close()
         payload = {"ok": False, "error": f"找不到 id={args.id}"}
         _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
         return 1
+
+    # 取全文才算「读过」（与 MCP 的 memory_get 同一口径）：
+    # 仅被检索召回不算访问，否则统计失去区分度。
+    store.record_access(conn, row["rel_path"])
+    stat = store.get_access_stat(conn, row["rel_path"]) or {}
+    conn.close()
 
     payload = {
         "ok": True,
@@ -204,6 +223,8 @@ def cmd_show(args) -> int:
         "status": row["status"],
         "tags": json.loads(row["tags"] or "[]"),
         "updated": row["updated"],
+        "access_count": stat.get("access_count", 1),
+        "last_accessed": stat.get("last_accessed", 0),
         "body": row["body"],
     }
     _emit(

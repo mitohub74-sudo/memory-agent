@@ -156,9 +156,14 @@ def test_v1_database_migrates_to_v2_and_keeps_data() -> None:
         try:
             store.init(conn)
 
+            # 断言「升到**当前**版本」而不是写死某个数字：这个测试关心的是
+            # 「v1 库能被一路升到最新」，而不是「v2 长什么样」。
+            # 写死数字会在每次加迁移时制造一次假红 —— 而假红会训练人「看见红就改测试」，
+            # 那是比不测更坏的习惯。（本轮加 MIGRATIONS[2] 时就撞上了这一点。）
             assert int(conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
-            ).fetchone()["value"]) == 2
+            ).fetchone()["value"]) == store.SCHEMA_VERSION
+            assert store.SCHEMA_VERSION >= 2, "本测试至少覆盖到 v2 引入的对象"
 
             tables = {
                 r["name"] for r in conn.execute(
@@ -166,6 +171,13 @@ def test_v1_database_migrates_to_v2_and_keeps_data() -> None:
                 )
             }
             assert "card_stats" in tables
+
+            # 每一级迁移引入的列都必须齐 —— 用「累积期望」而不是逐级硬编码，
+            # 这样再加迁移时这条测试不需要改，但漏列一定红。
+            expected = store._expected_through(store.SCHEMA_VERSION)
+            for table, cols in expected["columns"].items():
+                present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                assert cols <= present, f"{table} 缺列：{sorted(cols - present)}"
 
             # 原数据必须原样还在
             row = conn.execute(
@@ -276,6 +288,95 @@ def test_batch_delete_chunks_beyond_parameter_limit() -> None:
             assert store.count_cards(conn) == 0
             fts = conn.execute("SELECT COUNT(*) FROM cards_fts").fetchone()[0]
             assert int(fts) == 0, "分块删除后 FTS 也必须清空"
+        finally:
+            conn.close()
+
+
+def test_v2_database_migrates_to_v3_and_keeps_data() -> None:
+    """v2 → v3：新增取代相关三列，数据一行不少。
+
+    为什么要单独测这一级（而不是只测 v1 → 最新）：**用户手上的库现在正好是 v2**。
+    v1 → 最新 那条路径会一次性跑 MIGRATIONS[1] 和 [2] 两步，掩盖「单独跑第 2 步」的问题。
+    而真实升级场景是两级分开跑的。
+
+    这也印证了 `MIGRATIONS[1]` 绝不能被改动：它已经跑在用户的库上了，
+    改动会让「已升到 v2 的库」与「新升上来的库」结构不一致，而这是静默的。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-store-") as raw:
+        db = Path(raw) / "v2.db"
+        _make_v1_database(db)
+
+        # 先升到 v2（模拟用户当前的库），并塞一条访问统计 —— 它跨 v3 迁移必须存活
+        conn = store.connect(db)
+        try:
+            store.init(conn)
+            assert int(conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()["value"]) == store.SCHEMA_VERSION
+            store.record_access(conn, "03-Knowledge/旧卡.md", now=1_700_000_000)
+        finally:
+            conn.close()
+
+        # 把它「退回」成 v2：删掉 v3 引入的索引与三列（SQLite 3.35+ 支持 DROP COLUMN）
+        conn = sqlite3.connect(str(db))
+        try:
+            # 必须**先删索引**：索引依赖 invalid_at，先删列会报
+            # "error in index idx_cards_invalid_at after drop column"。
+            conn.execute("DROP INDEX IF EXISTS idx_cards_invalid_at")
+            for col in ("invalid_at", "superseded_by", "supersedes"):
+                conn.execute(f"ALTER TABLE cards DROP COLUMN {col}")
+            conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 确认现在确实是 v2 且没有新列
+        probe = sqlite3.connect(str(db))
+        try:
+            assert probe.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2"
+            cols = {r[1] for r in probe.execute("PRAGMA table_info(cards)")}
+            assert "invalid_at" not in cols
+            assert "priority" in cols, "v2 已有的列不该被这次构造弄丢"
+        finally:
+            probe.close()
+
+        # 跑迁移
+        conn = store.connect(db)
+        try:
+            store.init(conn)
+            assert int(conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()["value"]) == 3
+
+            row = conn.execute(
+                "SELECT * FROM cards WHERE rel_path = ?", ("03-Knowledge/旧卡.md",)
+            ).fetchone()
+            assert row is not None, "v2 → v3 不能丢卡片"
+            assert row["title"] == "旧卡标题"
+            assert row["content_hash"] == "abcdef1234567890"
+            # v2 的数据也要还在（迁移只该增量，不该重置已有内容）
+            assert row["priority"] == 0 and row["ttl"] == ""
+
+            # v3 的新列取默认值 —— 「仍有效」必须表现为 invalid_at 为空串
+            assert row["invalid_at"] == ""
+            assert row["superseded_by"] == ""
+            assert row["supersedes"] == ""
+
+            # 索引必须建起来（否则 --as-of 会全表扫）
+            indexes = {
+                r["name"] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'")
+            }
+            assert "idx_cards_invalid_at" in indexes
+
+            # 跨迁移的不可重建数据（访问统计）必须存活
+            stat = store.get_access_stat(conn, "03-Knowledge/旧卡.md")
+            assert stat is not None and stat["access_count"] == 1, stat
+
+            # 幂等：再跑一次不报错
+            store.init(conn)
+            assert store.count_cards(conn) == 1
         finally:
             conn.close()
 

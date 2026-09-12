@@ -71,7 +71,7 @@ SQLITE_MAX_VARIABLES = 999
 _LOCK_BACKOFF_SECONDS: tuple[float, ...] = (0.3, 0.8, 2.0, 4.0)
 _LOCK_RETRIES = len(_LOCK_BACKOFF_SECONDS)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 迁移表：MIGRATIONS[v] 是把 schema 从 v 升到 v+1 的 SQL 脚本。
 # 每一步都必须**只做增量**（ADD COLUMN / CREATE TABLE IF NOT EXISTS），
@@ -88,6 +88,25 @@ CREATE TABLE IF NOT EXISTS card_stats (
     access_count  INTEGER NOT NULL DEFAULT 0,
     last_accessed INTEGER NOT NULL DEFAULT 0
 );
+""",
+    # v2 → v3：取代（supersede）所需的三列。
+    #
+    # 三列都存 **rel_path 而不是 id**：id 是 rowid，index --rebuild 后必然重排，
+    # 取代关系会随之错位。本项目已经在 bench 真值上踩过一次这个坑（用 id 记录
+    # 真值，重建后全部错位，据此得出的结论是假的），不在同一块石头上绊第二次。
+    #
+    # 三列的语义：
+    #   invalid_at    失效时刻（空 = 仍有效）。用它可以做 --as-of 回溯。
+    #   superseded_by 取代我的那张卡的 rel_path（谁让我失效）
+    #   supersedes    被我取代的那张卡的 rel_path（我让谁失效）
+    # 正反两向都存，是为了让「这张卡被谁取代了」与「这张卡取代了谁」都是一次查询，
+    # 而不必反着扫全表。
+    2: """
+ALTER TABLE cards ADD COLUMN invalid_at    TEXT NOT NULL DEFAULT '';
+ALTER TABLE cards ADD COLUMN superseded_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE cards ADD COLUMN supersedes    TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_cards_invalid_at ON cards(invalid_at);
 """,
 }
 
@@ -112,14 +131,18 @@ CREATE TABLE IF NOT EXISTS cards (
     priority     INTEGER NOT NULL DEFAULT 0,     -- 优先级（frontmatter: priority）
     ttl          TEXT    NOT NULL DEFAULT '',    -- 原始 TTL 写法（frontmatter: ttl）
     expires_at   INTEGER NOT NULL DEFAULT 0,     -- 解析后的过期时刻（unix 秒），0 = 永不过期
+    invalid_at   TEXT    NOT NULL DEFAULT '',    -- 失效时刻（ISO），空 = 仍有效
+    superseded_by TEXT   NOT NULL DEFAULT '',    -- 取代我的那张卡（rel_path）
+    supersedes   TEXT    NOT NULL DEFAULT '',    -- 我取代的那张卡（rel_path）
     embedding    BLOB                            -- 预留：向量检索
 );
 
-CREATE INDEX IF NOT EXISTS idx_cards_kind     ON cards(kind);
-CREATE INDEX IF NOT EXISTS idx_cards_status   ON cards(status);
-CREATE INDEX IF NOT EXISTS idx_cards_source   ON cards(source);
-CREATE INDEX IF NOT EXISTS idx_cards_updated  ON cards(updated);
-CREATE INDEX IF NOT EXISTS idx_cards_priority ON cards(priority);
+CREATE INDEX IF NOT EXISTS idx_cards_kind       ON cards(kind);
+CREATE INDEX IF NOT EXISTS idx_cards_status     ON cards(status);
+CREATE INDEX IF NOT EXISTS idx_cards_source     ON cards(source);
+CREATE INDEX IF NOT EXISTS idx_cards_updated    ON cards(updated);
+CREATE INDEX IF NOT EXISTS idx_cards_priority   ON cards(priority);
+CREATE INDEX IF NOT EXISTS idx_cards_invalid_at ON cards(invalid_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS cards_fts USING fts5(
     title,
@@ -231,6 +254,10 @@ _EXPECTED: dict[int, dict[str, object]] = {
         "columns": {"cards": ("priority", "ttl", "expires_at")},
         "tables": ("card_stats",),
         "indexes": ("idx_cards_priority",),
+    },
+    3: {
+        "columns": {"cards": ("invalid_at", "superseded_by", "supersedes")},
+        "indexes": ("idx_cards_invalid_at",),
     },
 }
 
@@ -498,6 +525,9 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
         int(card.get("priority", 0) or 0),
         card.get("ttl", ""),
         int(card.get("expires_at", 0) or 0),
+        card.get("invalid_at", ""),
+        card.get("superseded_by", ""),
+        card.get("supersedes", ""),
     )
 
     if row is not None:
@@ -506,7 +536,8 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
             """UPDATE cards
                   SET title=?, kind=?, status=?, source=?, tags=?,
                       created=?, updated=?, body=?, content_hash=?,
-                      priority=?, ttl=?, expires_at=?
+                      priority=?, ttl=?, expires_at=?,
+                      invalid_at=?, superseded_by=?, supersedes=?
                 WHERE id=?""",
             fields + (card_id,),
         )
@@ -517,8 +548,9 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
         """INSERT INTO cards
                (rel_path, title, kind, status, source, tags,
                 created, updated, body, content_hash,
-                priority, ttl, expires_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                priority, ttl, expires_at,
+                invalid_at, superseded_by, supersedes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (rel,) + fields,
     )
     card_id = int(cur.lastrowid)

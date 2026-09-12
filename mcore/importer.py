@@ -25,7 +25,19 @@ __all__ = ["parse_frontmatter", "build_card", "sync", "sync_one"]
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
-    """解析 Markdown 开头的 YAML frontmatter，返回 (元数据, 正文)。"""
+    """解析 Markdown 开头的 YAML frontmatter，返回 (元数据, 正文)。
+
+    **先剥掉 BOM**。带 BOM 的文件（Windows 上很常见 —— PowerShell 的
+    ``Out-File -Encoding utf8``、记事本「UTF-8」默认都会加）第一行实际是
+    ``\\ufeff---``，与 ``"---"`` 不相等，于是 frontmatter 整个解析不出来：
+    标题退化成文件名、kind/source/tags 全空。**而且不报错** —— 看起来就是
+    「这张卡元数据没写」，没有人会想到是文件头的三个字节。
+
+    这个坑在本项目里被真实踩过两次（提交信息的 BOM 让远端标题显示乱码头、
+    用 PowerShell 还原源码让模块报 ``invalid non-printable character U+FEFF``），
+    所以读取侧一律先剥。
+    """
+    text = text.lstrip("\ufeff")
     lines = text.split("\n")
     if not lines or lines[0].strip() != "---":
         return {}, text
@@ -138,8 +150,17 @@ def _parse_ttl(raw) -> int:
 
 
 def build_card(vault: Path, path: Path) -> dict:
-    """把一个 Markdown 文件读成卡片字典。"""
-    text = path.read_text(encoding="utf-8", errors="replace")
+    """把一个 Markdown 文件读成卡片字典。
+
+    **严格解码（不用 ``errors="replace"``）**。替换模式会把非法字节变成
+    ``\\ufffd`` 然后**当作成功**继续走 —— 于是卡片内容被静默改写、还被索引进库，
+    而调用方拿到的是「索引成功」。那正是「能返回的假成功」。
+
+    改成严格解码后，非 UTF-8 文件会抛 ``UnicodeDecodeError``，由
+    :func:`sync` 的逐文件容错捕获、记进 ``errors``、并跳过该文件。
+    坏文件的正确结局是**被明确指出来**，不是被悄悄修改。
+    """
+    text = path.read_text(encoding="utf-8")
     meta, body = parse_frontmatter(text)
     rel = path.relative_to(vault).as_posix()
 
@@ -239,14 +260,41 @@ def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> 
 
     counts = {"inserted": 0, "updated": 0, "unchanged": 0}
     seen: set[str] = set()
+    errors: list[dict] = []
 
     for path in iter_markdown(vault):
-        card = build_card(vault, path)
-        seen.add(card["rel_path"])
-        counts[sync_one(conn, vault, path, card=card)] += 1
+        rel = path.relative_to(vault).as_posix()
+        # **每个文件都在自己的事务里。** 不这样做的话，坏文件抛错时
+        # 前面已处理的卡片会因为未提交而被丢弃 —— 一次失败丢掉整批进度。
+        try:
+            card = build_card(vault, path)
+            seen.add(card["rel_path"])
+            counts[sync_one(conn, vault, path, card=card)] += 1
+        except Exception as exc:
+            # 单文件失败**不中断**全量索引：一个坏文件不该让其余 N 张卡都进不去。
+            # 但必须做两件事，否则「容错」会变成「静默丢数据」：
+            #
+            # 1. **回滚**。失败的语句可能已经污染了事务（甚至留下一个待提交的
+            #    半截写），不回滚就会让后面的提交带上脏状态；
+            # 2. **仍然把这张卡算进 `seen`**。它是**存在于磁盘**的卡片，
+            #    只是这次读不了 —— 若不算进去，下面的删除检测会把它当成
+            #    「文件已消失」而从索引里删掉。那等于因为一个解析错误，
+            #    把一张好卡片从索引里抹掉，而且看起来一切正常。
+            _rollback_quietly(conn)
+            seen.add(rel)
+            errors.append({"path": rel, "error": f"{type(exc).__name__}: {exc}"})
 
     existing = {r["rel_path"] for r in conn.execute("SELECT rel_path FROM cards")}
     counts["removed"] = retry_on_locked(delete_cards, conn, sorted(existing - seen))
     # 提交本身也要抢写锁 —— 统一走自带重试的 store.commit，不要裸 conn.commit()。
     store_commit(conn)
+    counts["errors"] = errors
     return counts
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    """尽力回滚；回滚本身失败不覆盖原始异常（原始异常信息更有用）。"""
+    try:
+        conn.rollback()
+    except Exception:  # pragma: no cover - 连接已坏时只能放弃
+        pass

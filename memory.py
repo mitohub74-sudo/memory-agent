@@ -96,12 +96,16 @@ def cmd_index(args) -> int:
     conn = store.connect(db)
     store.init(conn)
     counts = importer.sync(conn, vault, rebuild=args.rebuild)
+    # errors 单独取出来给渲染用：它是「哪些卡没进去」的清单，
+    # 不能让调用方从 total 的数字差里猜。
+    errors = counts.get("errors", [])
     payload = {
         "ok": True,
         "mode": "rebuild" if args.rebuild else "incremental",
         "vault": str(vault),
         "db": str(db),
         "total": store.count_cards(conn),
+        "error_count": len(errors),
         **counts,
     }
     conn.close()
@@ -109,13 +113,22 @@ def cmd_index(args) -> int:
     _emit(
         payload,
         args.json,
-        lambda d: print(
-            f"{'全量重建' if d['mode'] == 'rebuild' else '增量同步'}完成  "
-            f"新增 {d['inserted']} · 更新 {d['updated']} · "
-            f"未变 {d['unchanged']} · 移除 {d['removed']}  共 {d['total']} 张"
-        ),
+        lambda d: _render_index(d, errors),
     )
     return 0
+
+
+def _render_index(d: dict, errors: list) -> None:
+    """同步结果的人类可读输出。坏文件走 stderr —— 它们是告警，不是结果。"""
+    print(
+        f"{'全量重建' if d['mode'] == 'rebuild' else '增量同步'}完成  "
+        f"新增 {d['inserted']} · 更新 {d['updated']} · "
+        f"未变 {d['unchanged']} · 移除 {d['removed']}  共 {d['total']} 张"
+    )
+    # 坏文件必须被明确说出来。静默跳过等于「索引成功」掩盖了「有几张没进去」，
+    # 而调用方会据此以为检索覆盖了全部语料。
+    for item in errors:
+        print(f"跳过（未索引）{item['path']}：{item['error']}", file=sys.stderr)
 
 
 def cmd_search(args) -> int:

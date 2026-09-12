@@ -1,26 +1,45 @@
 # memory-agent
 
-面向大模型的本地记忆检索。把散落的 Markdown 记忆卡索引成可快速检索的 SQLite。
+**给 agent 用的记忆层**：把已有的记忆汇总成一份可快速检索的本地索引，同时给没有记忆系统的 agent 提供一个。
 
-**主体服务对象是 agent，不是人。** 输出以机器可读为先，不做展示层。
+## 它解决什么
+
+记忆散落在各处 —— 有的 agent 自带记忆系统（各自的 Markdown、JSON、数据库），有的完全没有，关掉会话就忘光。
+
+memory-agent 做两件事：
+
+1. **汇总** —— 把已有记忆读出来，建成一份本地 SQLite 索引。**原文件不动，只读。**
+2. **提供** —— 给没有记忆系统的 agent 一套写入 + 检索能力，通过 MCP 或 CLI 接入。
+
+Markdown 是给人看的。但当记忆成百上千条时，模型靠逐个读文件既找不准也找不快 —— 索引解决的正是这一步。汇总与检索全程在本机完成，内容不出网。
+
+## 设计承诺
+
+| 承诺 | 实现方式 |
+|---|---|
+| **原文件只读** | 索引端只读取源文件，从不修改、从不删除。真相始终在你自己手里 |
+| **真相源与索引分离** | 原格式（Markdown 等）是真相源，SQLite 只是可重建的索引。删库可 `index --rebuild` 重建 |
+| **存储区独立于项目** | 记忆在 `~/.memory_agent`（路径可任意指定），代码在仓库。项目更新或程序失误不威胁记忆；重新克隆项目后配好 `config.json` 即可继续访问 |
+| **零运行依赖、内容不出网** | 仅用 Python 标准库；不做任何 LLM 调用，蒸馏交给调用方 agent |
+| **面向 agent 而非人** | 输出以机器可读为先（`--json`），不做展示层 |
+
+## 实现范围
+
+**已实现**：单源 Markdown 的采集 / 索引 / 检索、MCP 查询端、CLI、检索质量基准。
+
+**尚未实现**：多源整合（当前只接受一个 vault）、Markdown 以外的格式适配。
 
 ---
 
 ## 架构
 
 ```
-agent 会话 ──采集端──> Markdown vault ──索引端──> SQLite ──查询端──> agent
-                          (真相源)                 (可重建)      (MCP)
+agent 会话 ──采集端──> 记忆源（Markdown）──索引端──> SQLite ──查询端──> agent
+                        真相源 · 只读            (可重建)      (MCP)
 ```
 
 本仓库实现**采集端**（`mcore/capture.py`）、**索引端**（`mcore/importer.py`）与
 **查询端**（`mcore/mcp_server.py`），外加**检索质量基准**（`bench/retrieval_quality.py`）。
-
-## 核心约束
-
-1. **Markdown 是真相源**。SQLite 只是索引，删掉可用 `index --rebuild` 重建，数据零损失。
-2. **代码与数据分离**。仓库内不存任何记忆，也不硬编码本机路径。
-3. **零外部依赖**。仅用 Python 标准库。
 
 ---
 
@@ -58,6 +77,9 @@ python memory.py mcp                  # 启动 MCP server
 
 所有命令支持 `--json`。退出码：`0` 成功，`1` 无结果，`2` 环境错误。
 
+`search -n` 的取值范围是 `[1, 20]`，越界会被钳制 —— SQLite 的 `LIMIT -1` 表示**无上限**，
+不钳制就会把整张表倒出来。
+
 `search` 输出字段：`id` `path` `title` `kind` `source` `score` `matched` `snippet`。
 
 ---
@@ -69,8 +91,8 @@ python memory.py capture --title "标题" --body "正文" [--kind knowledge] [--
 # 正文也可从 stdin 读
 ```
 
-写入一张 Markdown 卡片到 vault。frontmatter 与既有卡片格式一致，因此新旧卡片共存、
-互相可检索。
+写入一张 Markdown 卡片到 vault，**落盘后立刻索引本卡** —— 不需要再手动跑 `index`，
+写完即可被 `search` 检索。frontmatter 与既有卡片格式一致，因此新旧卡片共存、互相可检索。
 
 ### 蒸馏交给调用方，本模块不调 LLM
 
@@ -85,9 +107,15 @@ python memory.py capture --title "标题" --body "正文" [--kind knowledge] [--
 
 | 情况 | 结果 |
 |---|---|
-| 新卡片 | 写入，返回 `created` |
+| 新卡片 | 写入并索引本卡，返回 `created` + `indexed: true` |
 | 标题与正文都相同 | 跳过，返回 `unchanged`（幂等） |
 | 正文 < 20 字符 | 拒绝，返回 `rejected` |
+| 索引失败 | 卡片仍在磁盘（真相源优先），返回 `indexed: false` + `warning` |
+
+索引只作用于**刚写入的这一张卡**，不触发全量同步（全量是 O(语料) 的）。
+索引失败**不回滚** Markdown —— 真相源优先，索引随时可用 `index --rebuild` 重建。
+
+CLI 的 `capture` 与 MCP 的 `memory_capture` 行为一致：两个入口，同一种结果。
 
 - 文件名由标题生成，中文原样保留（如 `nginx-站点根目录位置.md`）
 - 重名自动加序号后缀（`-2`、`-3`），**不覆盖已有卡片**
@@ -118,11 +146,11 @@ stdio 传输，每行一条 JSON-RPC 2.0 消息。协议版本 `2025-06-18` / `2
 
 | 工具 | 用途 |
 |---|---|
-| `memory_search` | 检索记忆，返回摘要 + id。参数 `query` `limit` `kind` `source` |
+| `memory_search` | 检索记忆，返回摘要 + id。参数 `query` `limit`（上限 20）`kind` `source` |
 | `memory_get` | 用 id 取卡片全文 |
-| `memory_capture` | **写入**一条知识。参数 `title` `body` `kind` `tags` |
+| `memory_capture` | **写入**一条知识并立即索引本卡。参数 `title` `body` `kind` `tags` |
 | `memory_stats` | 库概览（总数、类型/来源分布、最近更新） |
-| `memory_reindex` | 同步记忆源最新改动到索引，参数 `rebuild` |
+| `memory_reindex` | 手动补建索引（增量或 `rebuild` 全量）。正常写入已自动索引，此工具用于索引丢失或外部改动后补建 |
 
 工具描述是接口的一部分 —— LLM 靠它判断何时调用，写得含糊 agent 就不会用。
 

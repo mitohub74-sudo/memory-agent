@@ -23,7 +23,25 @@ from typing import Protocol, runtime_checkable
 
 from .tokenize import query_terms, to_query_expr
 
-__all__ = ["Hit", "Searcher", "KeywordSearcher"]
+__all__ = ["Hit", "Searcher", "KeywordSearcher", "MIN_LIMIT", "MAX_LIMIT", "clamp_limit"]
+
+# 检索条数边界。CLI 与 MCP 共用同一组常量 —— 两处各写一份迟早漂移。
+MIN_LIMIT = 1
+MAX_LIMIT = 20
+
+
+def clamp_limit(value: int | str | None) -> int:
+    """把条数钳制到 ``[MIN_LIMIT, MAX_LIMIT]``，非法值回落到 ``MIN_LIMIT``。
+
+    必须钳制的原因：SQLite 的 ``LIMIT -1`` 表示**无上限**。把 -1 原样传给
+    ``LIMIT ?`` 会把整张表倒出来 —— 调用方看到一大堆结果，以为「搜到了很多」，
+    实际是边界没处理。
+    """
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        n = MIN_LIMIT
+    return max(MIN_LIMIT, min(n, MAX_LIMIT))
 
 
 @dataclass

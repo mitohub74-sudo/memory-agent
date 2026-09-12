@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .store import delete_cards, upsert_card
 
-__all__ = ["parse_frontmatter", "build_card", "sync"]
+__all__ = ["parse_frontmatter", "build_card", "sync", "sync_one"]
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -116,11 +116,36 @@ def iter_markdown(vault: Path):
             yield path
 
 
+def sync_one(
+    conn: sqlite3.Connection,
+    vault: str | Path,
+    path: str | Path,
+    card: dict | None = None,
+) -> str:
+    """把一个 Markdown 文件同步进索引，返回 ``inserted`` / ``updated`` / ``unchanged``。
+
+    这是**唯一**的单文件索引入口 —— 全量 :func:`sync` 与采集端都走这里。
+
+    为什么要强调唯一：两处各写一套「建卡 + 写库」逻辑，迟早会在解析细节上分叉
+    （某一边先支持了新字段、某一边忘了处理 BOM）。分叉是**静默**的 ——
+    同一张卡在两条路径下得到不同结果，索引里出现 Markdown 中不存在的状态，
+    没有任何报错。
+
+    ``card`` 可传入已构建好的卡片字典，供全量同步复用，避免重复读文件。
+    """
+    if card is None:
+        card = build_card(Path(vault), Path(path))
+    return upsert_card(conn, card)
+
+
 def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> dict:
     """把 vault 同步进索引。
 
     返回各类计数：inserted / updated / unchanged / removed。
     ``rebuild=True`` 会先清空索引再全量导入（Markdown 不受影响）。
+
+    每个文件都经由 :func:`sync_one` 落库 —— 全量同步只是「遍历 + 逐个 sync_one」，
+    不另起一条写入路径。
     """
     vault = Path(vault)
     if not vault.is_dir():
@@ -137,7 +162,7 @@ def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> 
     for path in iter_markdown(vault):
         card = build_card(vault, path)
         seen.add(card["rel_path"])
-        counts[upsert_card(conn, card)] += 1
+        counts[sync_one(conn, vault, path, card=card)] += 1
 
     existing = {r["rel_path"] for r in conn.execute("SELECT rel_path FROM cards")}
     counts["removed"] = delete_cards(conn, sorted(existing - seen))

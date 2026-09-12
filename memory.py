@@ -48,10 +48,15 @@ def _emit(payload: dict | list, as_json: bool, render) -> None:
         render(payload)
 
 
-def _require_db(as_json: bool) -> bool:
-    if config.db_path().exists():
+def _require_db(db: Path, as_json: bool) -> bool:
+    """索引不存在就报错返回 False。
+
+    必须接收**已解析的** db 路径，而不是自己重新调一次 ``config.db_path()`` ——
+    否则 ``--db X`` 指向一个不存在的库时，这里检查的仍是默认路径，守卫形同虚设。
+    """
+    if db.exists():
         return True
-    msg = f"索引不存在：{config.db_path()}"
+    msg = f"索引不存在：{db}"
     if as_json:
         print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
     else:
@@ -63,7 +68,7 @@ def _require_db(as_json: bool) -> bool:
 
 
 def cmd_paths(args) -> int:
-    info = config.describe()
+    info = config.describe(args.db)
     _emit(
         info,
         args.json,
@@ -106,12 +111,14 @@ def cmd_index(args) -> int:
 
 
 def cmd_search(args) -> int:
-    if not _require_db(args.json):
+    db = config.db_path(args.db)
+    if not _require_db(db, args.json):
         return 2
 
-    conn = store.connect(config.db_path(args.db))
+    limit = search.clamp_limit(args.limit)
+    conn = store.connect(db)
     hits = search.KeywordSearcher(conn).search(
-        args.query, limit=args.limit, kind=args.kind, source=args.source
+        args.query, limit=limit, kind=args.kind, source=args.source
     )
     conn.close()
 
@@ -149,10 +156,10 @@ def cmd_search(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    if not _require_db(args.json):
+    db = config.db_path(args.db)
+    if not _require_db(db, args.json):
         return 2
 
-    db = config.db_path(args.db)
     conn = store.connect(db)
     s = store.stats(conn)
     conn.close()
@@ -171,7 +178,13 @@ def cmd_stats(args) -> int:
 
 
 def cmd_show(args) -> int:
-    conn = store.connect(config.db_path(args.db))
+    db = config.db_path(args.db)
+    # 守卫必须在 connect 之前 —— connect() 会顺手建库文件，
+    # 那样「索引不存在」就退化成「库存在但没这张卡」，退出码也从 2 变成 1。
+    if not _require_db(db, args.json):
+        return 2
+
+    conn = store.connect(db)
     row = store.get_card(conn, args.id)
     conn.close()
 
@@ -201,15 +214,21 @@ def cmd_show(args) -> int:
 
 
 def cmd_capture(args) -> int:
-    """写入一张知识卡。正文取自 --body，未给出则从 stdin 读。"""
+    """写入一张知识卡。正文取自 --body，未给出则从 stdin 读。
+
+    落盘后**立刻索引本卡**，与 MCP 的 ``memory_capture`` 行为一致 ——
+    否则同一个动作走两个入口会有两种结果：agent 通过 MCP 写能立即搜到，
+    人通过 CLI 写却搜不到，而两边返回的都是「成功」。
+    """
     body = args.body or ""
     if not body and not sys.stdin.isatty():
         body = sys.stdin.read()
 
     tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    vault = config.vault_path(args.vault)
 
     result = capture.write_card(
-        config.vault_path(args.vault),
+        vault,
         title=args.title,
         body=body,
         kind=args.kind,
@@ -217,14 +236,35 @@ def cmd_capture(args) -> int:
         source=args.source,
     )
 
-    def render(d):
-        if d["ok"]:
-            print(f"{d['action']}  {d.get('path', '')}")
-        else:
-            print(f"拒绝：{d['reason']}", file=sys.stderr)
+    if not result["ok"]:
+        _emit(result, args.json, lambda d: print(f"拒绝：{d['reason']}", file=sys.stderr))
+        return 1
 
-    _emit(result, args.json, render)
-    return 0 if result["ok"] else 1
+    # 索引失败不回滚 Markdown —— 真相源优先，索引可随时重建。
+    indexed, warning = False, ""
+    try:
+        conn = store.connect(config.db_path(args.db))
+        store.init(conn)
+        importer.sync_one(conn, vault, result["path"])
+        conn.commit()
+        conn.close()
+        indexed = True
+    except Exception as exc:
+        warning = (f"卡片已落盘（{result['path']}），但索引失败：{exc}。"
+                   f"可运行 python memory.py index 补建。")
+
+    payload = {**result, "indexed": indexed}
+    if warning:
+        payload["warning"] = warning
+
+    def render(d):
+        mark = "已索引" if d.get("indexed") else "未索引"
+        print(f"{d['action']}  {d.get('path', '')}  [{mark}]")
+        if d.get("warning"):
+            print(d["warning"], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
 
 
 def cmd_mcp(args) -> int:

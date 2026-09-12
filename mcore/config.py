@@ -79,14 +79,19 @@ def vault_path(override: str | None = None) -> Path:
     return data_home() / VAULT_DIRNAME
 
 
-def describe() -> dict:
-    """当前生效的路径，供机器读取与排查。"""
+def describe(db_override: str | None = None) -> dict:
+    """当前生效的路径，供机器读取与排查。
+
+    ``db_override`` 对应 CLI 的 ``--db``。传了就必须体现在结果里 ——
+    否则 ``paths`` 报告的路径与实际使用的不是同一个，排查时会把人带偏。
+    """
+    db = db_path(db_override)
     return {
         "data_home": str(data_home()),
         "config": str(config_path()),
         "config_exists": config_path().exists(),
-        "db": str(db_path()),
-        "db_exists": db_path().exists(),
+        "db": str(db),
+        "db_exists": db.exists(),
         "vault": str(vault_path()),
         "vault_exists": vault_path().is_dir(),
     }

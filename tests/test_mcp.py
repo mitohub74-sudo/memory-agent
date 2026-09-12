@@ -240,6 +240,12 @@ def main() -> int:
                 out = json.loads(t)
                 check("首次写入 action=created", out.get("action") == "created", str(out))
                 check("返回写入路径", bool(out.get("path")), str(out))
+                check("返回 indexed=true（已自动建索引）",
+                      out.get("indexed") is True, str(out))
+                check("文案声明本卡已索引",
+                      "已写入并索引" in str(out.get("note", "")), str(out.get("note")))
+                check("文案不含旧措辞「立即可被检索」",
+                      "立即可被检索" not in str(out), str(out))
             except json.JSONDecodeError:
                 check("capture 返回合法 JSON", False, t[:120])
 
@@ -251,6 +257,7 @@ def main() -> int:
                 out = json.loads(t)
                 check("重复写入 action=unchanged（幂等）",
                       out.get("action") == "unchanged", str(out))
+                check("幂等写入同样保证索引存在", out.get("indexed") is True, str(out))
             except json.JSONDecodeError:
                 check("重复写入返回合法 JSON", False, t[:120])
 
@@ -260,12 +267,13 @@ def main() -> int:
             check("过短正文被拒绝",
                   r.get("result", {}).get("isError") is True, str(r)[:120])
 
-            # 建索引后应能检索到
-            c2.request("tools/call", {"name": "memory_reindex", "arguments": {}})
+            # 关键：**不调 memory_reindex**，写入后直接检索。
+            # 若 capture 没有真正建索引，这里就会搜不到 —— 这正是要防的「假成功」。
             r = c2.request("tools/call", {"name": "memory_search",
                                           "arguments": {"query": "密钥"}})
             t = r.get("result", {}).get("content", [{}])[0].get("text", "")
-            check("写入的卡片可被检索到", "命中 1" in t or "命中 2" in t, t[:150])
+            check("capture 后不调 reindex 也能检索到",
+                  "命中 1" in t or "命中 2" in t, t[:150])
 
             # 中文标题应生成可读文件名
             files = list((Path(tmp) / "vault").rglob("*.md"))
@@ -304,7 +312,7 @@ def main() -> int:
                                           "title": "只含 requests 的卡",
                                           "body": "这张卡里只有 requests 这一个关键词，用于区分档位。",
                                           "kind": "knowledge"}})
-            c3.request("tools/call", {"name": "memory_reindex", "arguments": {}})
+            # 两张卡都由 capture 自动索引，无需 reindex
 
             def hits(query: str) -> str:
                 r = c3.request("tools/call", {"name": "memory_search",

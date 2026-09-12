@@ -93,6 +93,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "memory_capture",
         "description": (
             "把一条值得长期复用的知识写进记忆库，供以后所有会话和其他 agent 检索。"
+            "写入后本卡会被立即索引，不需要再调用 memory_reindex。"
             "触发时机：完成一个任务、解决一个报错、确认一个环境配置、做出一个"
             "影响后续的决策之后。"
             "写入前请自己先蒸馏——你是 LLM，用一两段话把结论写清楚，"
@@ -199,11 +200,7 @@ class MemoryServer:
                 f"先执行：python memory.py index   （或调用 memory_reindex）"
             )
 
-        try:
-            limit = int(args.get("limit") or 5)
-        except (TypeError, ValueError):
-            limit = 5
-        limit = max(1, min(limit, 20))
+        limit = search.clamp_limit(args.get("limit") or 5)
 
         hits = search.KeywordSearcher(self.conn).search(
             query,
@@ -265,8 +262,9 @@ class MemoryServer:
         if not isinstance(tags, list):
             tags = [t.strip() for t in str(tags).split(",") if t.strip()]
 
+        vault = config.vault_path()
         result = capture.write_card(
-            config.vault_path(),
+            vault,
             title=title,
             body=body,
             kind=str(args.get("kind") or "knowledge"),
@@ -277,16 +275,36 @@ class MemoryServer:
         if not result["ok"]:
             return _err(f"未写入：{result['reason']}")
 
-        note = {
-            "created": "已写入记忆库，立即可被检索。",
-            "unchanged": "内容相同，已存在，未重复写入。",
-        }.get(result["action"], result["action"])
+        # 落盘成功后立刻索引**本卡**（单文件），不走全量 sync —— 那是 O(语料)。
+        # 索引失败不回滚 Markdown：真相源优先，索引随时可用 index --rebuild 重建。
+        indexed, warning = False, ""
+        try:
+            store.init(self.conn)
+            importer.sync_one(self.conn, vault, result["path"])
+            self.conn.commit()
+            indexed = True
+        except Exception as exc:
+            warning = (
+                f"卡片已落盘（{result['path']}），但索引失败：{exc}。"
+                f"可调用 memory_reindex 补建。"
+            )
 
-        return _ok(json.dumps({
+        if result["action"] == "unchanged":
+            note = "内容相同，已存在，未重复写入。"
+        elif indexed:
+            note = "已写入并索引本卡，可立即被 memory_search 检索。"
+        else:
+            note = "已写入磁盘，但未建立索引 —— 见 warning。"
+
+        payload = {
             "action": result["action"],
             "path": result.get("path", ""),
+            "indexed": indexed,
             "note": note,
-        }, ensure_ascii=False, indent=2))
+        }
+        if warning:
+            payload["warning"] = warning
+        return _ok(json.dumps(payload, ensure_ascii=False, indent=2))
 
     def memory_stats(self, args: dict) -> dict:
         if self._index_missing():

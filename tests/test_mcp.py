@@ -530,6 +530,14 @@ def main() -> int:
             check("放宽档给出低置信提示",
                   "置信度偏低" in loose or "放宽档" in loose, loose[-300:])
             check("精确档不显示覆盖率", "覆盖率=" not in hits("sqlite3"), hits("sqlite3")[:300])
+            # P4-03：档位标签必须来自 search.MODE_LABELS（唯一来源）。
+            # 断言 MCP 实际输出里出现的是标签表里的字符串，而不是某个内联副本。
+            from mcore.search import MODE_LABELS
+            strict = hits("sqlite3")
+            check("精确档标签与 MODE_LABELS 一致",
+                  f"匹配模式={MODE_LABELS['all']}" in strict, strict[:200])
+            check("放宽档标签与 MODE_LABELS 一致",
+                  f"匹配模式={MODE_LABELS['any']}" in loose, loose[:200])
         finally:
             c3.close()
             shutil.rmtree(tmp3, ignore_errors=True)

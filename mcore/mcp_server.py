@@ -355,7 +355,7 @@ class MemoryServer:
         try:
             store.init(self.conn)
             importer.sync_one(self.conn, vault, result["path"])
-            self.conn.commit()
+            store.commit(self.conn)
             indexed = True
         except Exception as exc:
             warning = (

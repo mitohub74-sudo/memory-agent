@@ -17,7 +17,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .store import delete_cards, upsert_card
+from .store import delete_cards, retry_on_locked, upsert_card
+from .store import commit as store_commit
 
 __all__ = ["parse_frontmatter", "build_card", "sync", "sync_one"]
 
@@ -208,7 +209,9 @@ def sync_one(
     store_init(conn)
     if card is None:
         card = build_card(Path(vault), Path(path))
-    return upsert_card(conn, card)
+    # 撞上写锁时重试：另一个进程可能正在 capture / reindex。
+    # 只重试锁错误，缺表缺列之类的真错误仍然立刻抛出。
+    return retry_on_locked(upsert_card, conn, card)
 
 
 def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> dict:
@@ -243,6 +246,7 @@ def sync(conn: sqlite3.Connection, vault: str | Path, rebuild: bool = False) -> 
         counts[sync_one(conn, vault, path, card=card)] += 1
 
     existing = {r["rel_path"] for r in conn.execute("SELECT rel_path FROM cards")}
-    counts["removed"] = delete_cards(conn, sorted(existing - seen))
-    conn.commit()
+    counts["removed"] = retry_on_locked(delete_cards, conn, sorted(existing - seen))
+    # 提交本身也要抢写锁 —— 统一走自带重试的 store.commit，不要裸 conn.commit()。
+    store_commit(conn)
     return counts

@@ -27,6 +27,7 @@ from pathlib import Path
 __all__ = [
     "SCHEMA_VERSION",
     "MIGRATIONS",
+    "BUSY_TIMEOUT_MS",
     "connect",
     "init",
     "upsert_card",
@@ -38,7 +39,34 @@ __all__ = [
     "record_access",
     "access_stats",
     "get_access_stat",
+    "retry_on_locked",
+    "is_locked_error",
+    "commit",
 ]
+
+# SQLite 的默认 busy 处理是「立刻失败」。多个进程同时写（例如两个 agent 会话
+# 同时 capture）就会随机抛 "database is locked" —— 而且它是**间歇性**的，
+# 手动重跑往往就好了，于是最容易被当成偶发噪音放过。
+#
+# 为什么是 5000ms：足够跨过一次正常写入的持锁时间（单卡写入是毫秒级），
+# 又不至于让真正卡死的情况无限等下去。P3-01 的全量迁移也是在这个窗口内完成的。
+BUSY_TIMEOUT_MS = 5000
+
+# 锁重试计划（秒）。**这不是随手取的退避**，而是针对一个具体机制的修正：
+#
+# ``busy_timeout`` 只在「等一个会自己释放的锁」时生效。而 ``_init_once`` 里
+# 「先读 meta 拿 schema_version、再执行 DDL」是**读事务升级为写事务**；
+# 一旦此时别的进程正持有写锁，SQLite 会**立即**返回 SQLITE_BUSY，
+# **不调用 busy handler**（升级不能等待，否则就成了死锁）。
+#
+# 所以第一次重试必须等得比「另一个进程建完表」更久 —— 几十毫秒不够。
+# 实测证据：原计划 [0.05, 0.1, 0.2] 在 2 个进程同时启动时**每轮必然有 1 个失败**；
+# 把 busy_timeout 从 5 秒提到 30 秒**毫无改善** —— 这正好证明根本没走 busy handler，
+# 而不是「锁等得不够久」。
+#
+# 每次重试都会重头跑 `_init_once`：如果对手已经把表建好，重试就直接走只读快路径返回。
+_LOCK_BACKOFF_SECONDS: tuple[float, ...] = (0.3, 0.8, 2.0, 4.0)
+_LOCK_RETRIES = len(_LOCK_BACKOFF_SECONDS)
 
 SCHEMA_VERSION = 2
 
@@ -107,15 +135,181 @@ CREATE TABLE IF NOT EXISTS card_stats (
 """
 
 
+def current_journal_mode(conn: sqlite3.Connection) -> str:
+    """读当前 journal_mode（只读查询）。"""
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    return str(row[0] if row is not None else "").lower()
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
-    """打开（必要时创建）数据库连接。"""
+    """打开（必要时创建）数据库连接。
+
+    ``isolation_level=None`` 关掉 Python sqlite3 的**隐式事务控制**，改为完全显式。
+    三个理由，缺一不可：
+
+    1. 隐式模式下，``PRAGMA`` / ``CREATE`` 这类语句会偷偷开启一个事务，我们再去
+       ``BEGIN IMMEDIATE`` 就会撞上 ``cannot start a transaction within a transaction``；
+    2. 隐式模式会让「读一句、写一句」悄悄变成「读事务升级写事务」，
+       也就是 WAL 下会返回 ``SQLITE_BUSY_SNAPSHOT`` 的那个坑（见 ``_init_once``）；
+    3. 写入方究竟什么时候提交，变得取决于「上一次执行了什么语句」，
+       而这类推理错误的表现是**间歇性**的锁失败，最难查。
+
+    **``journal_mode`` 只在还不是 WAL 时才去切换** —— 这是本轮排查的根因所在。
+    ``PRAGMA journal_mode=WAL`` 会**真的写库**（要拿独占锁，写入文件头）。多个进程
+    同时启动时，输掉竞争的那个会在这里抛 ``database is locked``；而这个异常**不在**
+    任何重试范围内（它发生在建连接阶段），于是表现为「一个进程查不到原因地索引失败」。
+
+    实测：并发 2 个进程、每轮**必然**有 1 个失败，且失败点在 ``store.connect`` 而不是
+    建表逻辑 —— 这就是那条线索的价值：把「必然是 1 个」当成重试不够久的证据会一直修错地方。
+    WAL 是**持久属性**（写进文件头），所以建好之后每次连接只需一次只读 PRAGMA 确认。
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    if current_journal_mode(conn) != "wal":
+        # 首次切换仍可能撞上别的进程正在切，所以给它重试；失败也不致命 ——
+        # WAL 只是更好的并发模式，退回默认模式功能完全可用，不该因此让 capture 失败。
+        try:
+            retry_on_locked(conn.execute, "PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("PRAGMA synchronous=NORMAL")
+    # 多个进程同时写时，不要在第一个锁上就失败；等一会儿再试。
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     return conn
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """是不是「数据库被别的进程锁住」这一类错误。
+
+    按**错误信息**判断而不是 ``sqlite3.OperationalError`` 类型：OperationalError
+    覆盖了缺表、语法错、列不存在等一大堆问题，把它们也重试只会浪费时间并掩盖真错误。
+    """
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def retry_on_locked(fn, *args, **kwargs):
+    """执行可能撞上写锁的操作；只对锁错误重试，别的一律原样抛出。
+
+    ``busy_timeout`` 已经让 SQLite 自己在内核层面等锁了，这一层是它等满之后的兜底。
+    重试的是**整个调用**而不是重开连接：调用方传进来的 ``conn`` 仍然有效
+    （SQLite 的锁失败不会让连接失效），重开连接反而会丢掉未提交的状态。
+
+    退避时间见 ``_LOCK_BACKOFF_SECONDS`` 的注释 —— 那里解释了为什么第一次要等 0.3 秒。
+    """
+    for attempt in range(_LOCK_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if attempt >= _LOCK_RETRIES or not is_locked_error(exc):
+                raise
+            time.sleep(_LOCK_BACKOFF_SECONDS[attempt])
+    raise AssertionError("不可达：重试循环必然返回或抛出")  # pragma: no cover
+
+
+# 每个版本「应该长什么样」的检查清单（只列该版本**新增**的对象）。
+# 用途只有一个：判断当前库是否已经符合期望，从而**决定要不要写**。
+#
+# 为什么不直接「每次都跑一遍 IF NOT EXISTS 的 DDL」：DDL 是**写操作**，要向
+# SQLite 申请写锁。多个进程同时 capture 时，六个进程会在 init 阶段一起抢锁，
+# 输的那些等满 busy_timeout 后失败 —— 实测并发 6 个进程约 40% 概率出现
+# "database is locked"。而这些 DDL 在正常情况下**一行都不会改变任何东西**，
+# 纯粹是无谓的写竞争。既然能只读判断，就不该用写来问。
+_EXPECTED: dict[int, dict[str, object]] = {
+    1: {
+        "columns": {"cards": ("id", "rel_path", "title", "kind", "status", "source",
+                              "tags", "created", "updated", "body", "content_hash",
+                              "embedding")},
+        "tables": ("cards", "cards_fts", "meta"),
+    },
+    2: {
+        "columns": {"cards": ("priority", "ttl", "expires_at")},
+        "tables": ("card_stats",),
+        "indexes": ("idx_cards_priority",),
+    },
+}
+
+
+def _expected_through(version: int) -> dict[str, set[str]]:
+    """把 1..version 的期望合并成一份「必须存在」的清单。"""
+    columns: dict[str, set[str]] = {}
+    tables: set[str] = set()
+    indexes: set[str] = set()
+    for v in range(1, version + 1):
+        spec = _EXPECTED.get(v, {})
+        for table, cols in (spec.get("columns") or {}).items():  # type: ignore[union-attr]
+            columns.setdefault(table, set()).update(cols)  # type: ignore[arg-type]
+        tables.update(spec.get("tables") or ())  # type: ignore[arg-type]
+        indexes.update(spec.get("indexes") or ())  # type: ignore[arg-type]
+    return {"columns": columns, "tables": tables, "indexes": indexes}  # type: ignore[dict-item]
+
+
+def _reopen(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """关掉旧连接、按同一路径重开一个，用于锁重试。"""
+    try:
+        path = _db_path_of(conn)
+    except Exception:
+        return conn
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return connect(path)
+
+
+def _db_path_of(conn: sqlite3.Connection) -> str:
+    """取连接的数据库文件路径（``PRAGMA database_list`` 是只读的）。"""
+    for row in conn.execute("PRAGMA database_list"):
+        if row["name"] == "main":
+            return row["file"]
+    raise RuntimeError("连接没有 main 数据库路径")
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    """当前库是否已完全符合 SCHEMA_VERSION 的期望（**全部只读查询**）。
+
+    返回 True 时调用方可以放心跳过 DDL —— 因为期望清单是「按版本累积」的，
+    低版本库里缺的列 / 表 / 索引都会在这里被发现，不会被误判成「已就绪」。
+    """
+    expected = _expected_through(SCHEMA_VERSION)
+
+    existing_tables = {
+        r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+        )
+    }
+    if not set(expected["tables"]).issubset(existing_tables):
+        return False
+
+    existing_indexes = {
+        r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    if not set(expected["indexes"]).issubset(existing_indexes):
+        return False
+
+    for table, cols in expected["columns"].items():  # type: ignore[union-attr]
+        # PRAGMA table_info 是只读的；表不存在时返回空集合，正好落入「不符合」
+        present = {
+            r["name"] for r in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not cols.issubset(present):
+            return False
+    return True
+
+
+def commit(conn: sqlite3.Connection) -> None:
+    """提交事务，撞锁时重试。
+
+    **每个写路径都必须用它，而不是裸 ``conn.commit()``。**
+    提交本身要向 SQLite 申请写锁；多进程并发写时，输掉竞争的就是在提交这一步
+    失败 —— 实测确认过：并发 6 个 CLI ``capture``，去掉这一层后必然有一个返回
+    ``indexed: false`` 并附带 ``database is locked`` 警告。
+    """
+    retry_on_locked(conn.commit)
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int | None:
@@ -146,7 +340,7 @@ def _write_schema_version(conn: sqlite3.Connection, version: int) -> None:
 
 
 def init(conn: sqlite3.Connection) -> None:
-    """建表并把 schema 升到当前版本。幂等。
+    """建表并把 schema 升到当前版本。幂等，且**自带写锁重试**。
 
     三种情况分开处理：
 
@@ -154,16 +348,71 @@ def init(conn: sqlite3.Connection) -> None:
     - **库版本 < 代码版本** → 逐级跑 MIGRATIONS，跑完再补一遍 DDL
     - **库版本 > 代码版本** → **报错**。库比代码新，说明用旧代码打开了新库；
       继续跑就是拿旧结构去读新数据，而损坏是静默的。
+
+    为什么重试放在这里而不是调用方：**DDL 也是写操作**。即使版本一致、什么
+    都不用改，末尾那遍 ``executescript`` 仍要向 SQLite 申请写锁。多个进程同时
+    ``capture`` 时，输掉竞争的那个会在 init 阶段就撞上 ``database is locked`` ——
+    实测确认过（去掉重试后并发 6 个进程必然有一个失败）。
+
+    实测教训（这一条值一次真实的排查）：**锁失败后不能只在同一个连接上重试**。
+    WAL 模式下连接可能持有一个已经过期的读快照，此时 ``SQLITE_BUSY_SNAPSHOT``
+    表示「这个快照**永远**无法升级成功」，同一连接上重试多少次都一样。
+    所以撞锁时我们会**关掉连接重新打开**（拿到新快照），再重试。
     """
+    for attempt in range(_LOCK_RETRIES + 1):
+        try:
+            return _init_once(conn)
+        except sqlite3.OperationalError as exc:
+            if attempt >= _LOCK_RETRIES or not is_locked_error(exc):
+                raise
+            time.sleep(_LOCK_BACKOFF_SECONDS[attempt])
+            # 关键：换一个连接，丢掉可能已过期的读快照。
+            conn = _reopen(conn)
+
+
+def _exec_script(conn: sqlite3.Connection, script: str) -> None:
+    """在**当前事务内**逐条执行脚本。
+
+    不用 ``conn.executescript``：它会先隐式 COMMIT，把外层 ``BEGIN IMMEDIATE``
+    刚拿到的写锁放掉 —— 那样就等于又回到了「读事务升级写事务」的老路。
+    本项目的 DDL/迁移脚本里没有分号出现在字符串字面量中的情况（都是纯 DDL），
+    按分号切分是安全的。
+    """
+    for stmt in script.split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+
+
+def _init_once(conn: sqlite3.Connection) -> None:
+    """在**一个 IMMEDIATE 写事务**里完成建表 / 迁移。
+
+    为什么必须是 IMMEDIATE，而不是「先读后写」：
+
+    WAL 模式下，连接先在读事务里读 ``meta.schema_version``，再想升级成写事务时，
+    如果 WAL 已经被别的进程推进过，SQLite 会返回 ``SQLITE_BUSY_SNAPSHOT`` ——
+    表示「这个读快照已经过期，**永远**无法升级成功」。关键点是：
+
+    - 它**立刻**返回，不走 ``busy_timeout``（没有可等的释放）；
+    - 在此连接上**重试永远不会成功**（快照已失效），除非关闭连接重开。
+
+    实测印证过这两点：并发 2 个进程时**每轮必然有 1 个失败**，且把
+    ``busy_timeout`` 从 5 秒提到 30 秒、把重试退避加到 7 秒，**都没有任何改善**。
+    这也解释了为什么「一个进程一个工作区」的环境下从来没人见过它。
+
+    ``BEGIN IMMEDIATE`` 一开始就申请写锁，于是等待交给 busy handler（能等、会成功），
+    也不存在「读快照过期」这回事。建表与迁移本来就是写操作，用写事务做名正言顺。
+    """
+    conn.execute("BEGIN IMMEDIATE")
     current = _read_schema_version(conn)
 
     if current is None:
-        conn.executescript(_DDL)
+        _exec_script(conn, _DDL)
         _write_schema_version(conn, SCHEMA_VERSION)
         conn.commit()
         return
 
     if current > SCHEMA_VERSION:
+        conn.rollback()
         raise RuntimeError(
             f"索引库的 schema 版本（{current}）高于本代码支持的版本（{SCHEMA_VERSION}）。"
             f"请升级 memory-agent，或改用匹配版本的代码。"
@@ -174,10 +423,15 @@ def init(conn: sqlite3.Connection) -> None:
         for v in range(current, SCHEMA_VERSION):
             script = MIGRATIONS.get(v)
             if script is None:
+                conn.rollback()
                 raise RuntimeError(f"缺少 v{v} → v{v + 1} 的迁移脚本")
             try:
-                conn.executescript(script)
+                _exec_script(conn, script)
             except sqlite3.OperationalError as exc:
+                conn.rollback()
+                # 锁错误交给外层重试；别在这里误判成「结构不对」。
+                if is_locked_error(exc):
+                    raise
                 raise RuntimeError(
                     f"执行 v{v} → v{v + 1} 迁移失败：{exc}。"
                     f"索引库可能不是 v{v} 结构（被人手动改过，或来自更早的实验版本）。"
@@ -186,12 +440,16 @@ def init(conn: sqlite3.Connection) -> None:
         _write_schema_version(conn, SCHEMA_VERSION)
         # 迁移只负责「补上这一步的差异」。跑完再走一遍 DDL，
         # 保证老库里缺的、与本次迁移无关的表也不会漏掉（DDL 全是 IF NOT EXISTS）。
-        conn.executescript(_DDL)
+        _exec_script(conn, _DDL)
         conn.commit()
         return
 
-    # 版本一致：仍跑一遍 DDL（全部 IF NOT EXISTS），保证表齐全
-    conn.executescript(_DDL)
+    # 版本一致：结构齐了就什么都不用做。这个判断必须在**已经拿到写锁之后**做，
+    # 否则就成了「只读查一下 → 决定要不要写」的升级路径（见 init 的 docstring）。
+    if _schema_is_current(conn):
+        conn.commit()
+        return
+    _exec_script(conn, _DDL)
     conn.commit()
 
 

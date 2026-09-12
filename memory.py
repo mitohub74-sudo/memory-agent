@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """memory-agent CLI —— 面向大模型的本地记忆检索。
 
@@ -297,7 +297,9 @@ def cmd_capture(args) -> int:
         conn = store.connect(config.db_path(args.db))
         store.init(conn)
         importer.sync_one(conn, vault, result["path"])
-        conn.commit()
+        # 用 store.commit（自带锁重试），不要裸 conn.commit：
+        # 提交也要抢写锁，并发 capture 时正是在这里失败的。
+        store.commit(conn)
         conn.close()
         indexed = True
     except Exception as exc:

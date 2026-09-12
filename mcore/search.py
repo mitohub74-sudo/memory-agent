@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .tokenize import query_terms, tokenize, to_query_expr
+from .tokenize import query_terms, to_query_expr
 
 __all__ = ["Hit", "Searcher", "KeywordSearcher"]
 
@@ -103,9 +103,18 @@ class KeywordSearcher:
         3. ``any``         OR  精确，任一整词命中
         4. ``any-prefix``  OR  前缀，任一前缀命中
 
-    OR 档位的 BM25 排序不可靠：长文档和高频词会主导分数，出现「命中词更少
-    但排得更前」的情况 —— 表现为返回一堆看着相关、其实无关的卡。所以 OR
-    档位多取候选，先按「命中了几个查询词」重排，再截断。
+    实测（``python memory.py bench``，49 张卡）：关键词查询**全部**在 ``all``
+    档命中，从不降级；只有整句自然语言查询会落到 ``any``。所以 OR 档的排序
+    质量只影响自然语言查询。
+
+    曾经给 OR 档加过「先按命中词数重排、再按 BM25」的逻辑，动机是怀疑 BM25
+    在 OR 档失真。实测证伪并发现它是**负优化**：唯一一条受影响的查询
+    「本地装了什么模型」，目标卡从第 4 名被推到第 9 名，封顶 P@5 由 66.7%
+    降到 55.6%，其余查询无变化。故已移除 —— 不要再加回来，除非基准
+    （``bench/retrieval_quality.py``）显示有正收益。
+
+    ``fallback_any=False`` 时只走前两档（AND 精确 + AND 前缀），
+    用于「宁缺毋滥」的调用场景。
     """
 
     name = "keyword"
@@ -143,17 +152,6 @@ class KeywordSearcher:
         return self.conn.execute("\n".join(sql), params).fetchall()
 
     @staticmethod
-    def _coverage(row, terms: list[str]) -> int:
-        """这张卡命中了几个查询词（整词、大小写不敏感）。"""
-        toks = set(tokenize(row["title"])) | set(tokenize(row["body"]))
-        return sum(1 for t in terms if t in toks)
-
-    @classmethod
-    def _rank_by_coverage(cls, rows, terms: list[str]):
-        """先按命中词数降序，再按 BM25 升序（bm25 越小越相关）。"""
-        return sorted(rows, key=lambda r: (-cls._coverage(r, terms), float(r["score"])))
-
-    @staticmethod
     def _to_hit(row, query: str, mode: str) -> Hit:
         return Hit(
             card_id=int(row["id"]),
@@ -183,12 +181,7 @@ class KeywordSearcher:
             expr = to_query_expr(query, joiner, prefix=prefix)
             if not expr:
                 continue
-            # OR 档位要重排，先多取候选再截断
-            pool = limit if joiner == "all" else max(limit * 5, 50)
-            rows = self._run(expr, pool, kind, source)
-            if not rows:
-                continue
-            if joiner == "any":
-                rows = self._rank_by_coverage(rows, terms)
-            return [self._to_hit(r, query, mode) for r in rows[:limit]]
+            rows = self._run(expr, limit, kind, source)
+            if rows:
+                return [self._to_hit(r, query, mode) for r in rows]
         return []

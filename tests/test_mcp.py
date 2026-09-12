@@ -280,7 +280,7 @@ def main() -> int:
             shutil.rmtree(tmp, ignore_errors=True)
 
         # ---------------------------------------------------- 检索档位
-        print("\n[9] 检索档位：前缀匹配与 OR 覆盖数重排")
+        print("\n[9] 检索档位：四档降级与前缀匹配")
         tmp3 = tempfile.mkdtemp(prefix="memory-agent-tier-")
         c3 = Client(env={
             "MEMORY_AGENT_VAULT": str(Path(tmp3) / "vault"),
@@ -298,6 +298,12 @@ def main() -> int:
                                           "body": ("调用 getUserById 获取用户，再用 tokenizeText "
                                                    "处理，依赖 sqlite3 和 requests 库。"),
                                           "kind": "knowledge"}})
+            # 第二张卡只含 requests —— 用来验证 AND 档成功时不会降级到 OR
+            c3.request("tools/call", {"name": "memory_capture",
+                                      "arguments": {
+                                          "title": "只含 requests 的卡",
+                                          "body": "这张卡里只有 requests 这一个关键词，用于区分档位。",
+                                          "kind": "knowledge"}})
             c3.request("tools/call", {"name": "memory_reindex", "arguments": {}})
 
             def hits(query: str) -> str:
@@ -308,10 +314,22 @@ def main() -> int:
             check("整词命中走 AND 精确档", "AND 精确" in hits("sqlite3"))
             check("前缀档：sqlite 命中 sqlite3", "命中 1" in hits("sqlite"))
             check("前缀档标注为 AND 前缀", "AND 前缀" in hits("sqlite"))
-            check("前缀档：request 命中 requests", "命中 1" in hits("request"))
+            check("前缀档：request 命中 requests（两张卡都含）", "命中 2" in hits("request"))
+            check("前缀档：request 标注为 AND 前缀", "AND 前缀" in hits("request"))
             check("前缀档：tokenize 命中 tokenizeText", "命中 1" in hits("tokenize"))
             check("单字不加前缀，不放大噪音", "没有与" in hits("a"))
             check("词中片段仍搜不到（已知局限，非缺陷）", "没有与" in hits("userById"))
+
+            # 档位优先级：两个词都能被 AND 满足时，不许降级到 OR。
+            # 若降级，第二张卡（只含 requests）也会被召回，命中数会变成 2。
+            both = hits("sqlite3 requests")
+            check("AND 档可满足时不降级到 OR（命中 1 而非 2）", "命中 1" in both)
+            check("AND 档可满足时标注 AND 精确", "AND 精确" in both)
+
+            # AND 无法满足时才降级：加入语料里不存在的词，AND 必然失败
+            loose = hits("sqlite3 requests zzznotexist")
+            check("AND 无法满足时降级到 OR", "OR" in loose)
+            check("降级后召回更宽（命中 2）", "命中 2" in loose)
         finally:
             c3.close()
             shutil.rmtree(tmp3, ignore_errors=True)

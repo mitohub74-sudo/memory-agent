@@ -232,6 +232,34 @@ def cmd_mcp(args) -> int:
     return mcp_server.serve()
 
 
+def cmd_bench(args) -> int:
+    """运行检索质量基准。实现放在 bench/retrieval_quality.py。
+
+    真值文件默认取数据目录下的 bench_queries.json —— 与代码分离，仓库内不含
+    本机数据。真值按 rel_path 记录而非整数 id：索引重建后 rowid 会重排，
+    按 id 记真值会导致错位（踩过一次，结论因此全错）。
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "bench" / "retrieval_quality.py"
+    spec = importlib.util.spec_from_file_location("_memory_bench", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    argv: list[str] = ["--limit", str(args.limit)]
+    for flag, val in (
+        ("--db", args.db),
+        ("--queries", args.queries),
+        ("--baseline", args.baseline),
+        ("--save", args.save),
+    ):
+        if val:
+            argv += [flag, val]
+    if args.json:
+        argv.append("--json")
+    return mod.main(argv)
+
+
 # --------------------------------------------------------------------- 入口
 
 
@@ -272,6 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     pm = sub.add_parser("mcp", help="启动 MCP stdio server（供 agent 调用）")
     pm.set_defaults(func=cmd_mcp)
+
+    pb = sub.add_parser("bench", help="检索质量基准（真值在数据目录，不进仓库）")
+    pb.add_argument("--queries", help="真值文件，默认 {数据目录}/bench_queries.json")
+    pb.add_argument("-n", "--limit", type=int, default=10, help="每条查询取前 N 条")
+    pb.add_argument("--baseline", help="基线 JSON；任一指标退化则退出码 1")
+    pb.add_argument("--save", help="把本次结果写入 JSON（可当基线）")
+    pb.add_argument("--json", action="store_true")
+    pb.set_defaults(func=cmd_bench)
 
     pc = sub.add_parser("capture", help="写入一张知识卡（采集端）")
     pc.add_argument("--title", required=True, help="卡片标题")

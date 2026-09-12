@@ -17,8 +17,20 @@
 
 这样「私钥」这类 2 字词才会成为独立 token。
 
-英文侧保留 _ . / - 等字符，让 ecs-prod、id_ed25519、var/www 这类
-标识符保持完整，不被切成碎片。
+英文侧在**入库串**里保留 _ . / - 等字符（``ecs-prod``、``id_ed25519``、
+``var/www`` 写成单个 token），但要注意这一步并不能让它们真的不被切开：
+FTS5 的 unicode61 分词器还会再切一次。
+
+实测（SQLite 3.53.1，``fts5vocab(main, cards_fts, 'row')``）：
+
+    id_ed25519   索引里**不存在**这个 term
+    id           存在（11 张卡）
+    ed25519      存在（3 张卡）
+
+即 ``_`` 是 unicode61 的分隔符，``id_ed25519`` 实际被切成 ``id`` + ``ed25519``。
+
+后果是**好的**：搜 ``ed25519`` 能命中 ``id_ed25519``；搜 ``"id_ed25519"``
+作为短语也能命中（两个 token 相邻）。所以不必自己再拆一遍。
 """
 
 from __future__ import annotations
@@ -30,7 +42,8 @@ __all__ = ["tokenize", "to_index_text", "query_terms", "to_query_expr"]
 # 连续的中日韩统一表意文字（基本区 + 扩展 A）
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]+")
 
-# 英文 / 数字 / 标识符：保留 _ . / - 以便匹配 ecs-prod、id_ed25519、var/www
+# 英文 / 数字 / 标识符：入库串里保留 _ . / - ，以便短语查询能整体命中
+# （FTS5 的 unicode61 仍会按 _ . / - 再切一次，见模块 docstring）
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-/]*")
 
 

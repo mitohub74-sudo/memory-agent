@@ -119,7 +119,6 @@ def run_query(searcher, cards, spec: dict, limit: int) -> dict:
     # 「相关卡用完了」而不是「返回了噪音」。所以分母取 min(K, 相关卡数)。
     # 这个口径才真正回答「会不会一次返回一堆无用结果」。
     cap5 = min(5, len(gold))
-    cap10 = min(10, len(gold))
 
     return {
         "query": query,

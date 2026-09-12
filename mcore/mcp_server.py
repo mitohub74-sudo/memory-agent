@@ -26,13 +26,13 @@ import sys
 from typing import Any
 
 from . import capture, config, importer, search, store
+from .version import __version__ as SERVER_VERSION
 
 __all__ = ["SUPPORTED_PROTOCOL_VERSIONS", "DEFAULT_PROTOCOL_VERSION", "TOOLS", "serve"]
 
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-agent"
-SERVER_VERSION = "0.3.0"
 
 # JSON-RPC 错误码
 PARSE_ERROR = -32700

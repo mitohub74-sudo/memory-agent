@@ -24,6 +24,7 @@ from pathlib import Path
 
 __all__ = [
     "SCHEMA_VERSION",
+    "MIGRATIONS",
     "connect",
     "init",
     "upsert_card",
@@ -35,6 +36,11 @@ __all__ = [
 ]
 
 SCHEMA_VERSION = 1
+
+# 迁移表：MIGRATIONS[v] 是把 schema 从 v 升到 v+1 的 SQL 脚本。
+# 当前只有 v1（初始版本），所以表是空的 —— 机制先就位。
+# 阶段 3 加 card_stats 表时：写 MIGRATIONS[1] = "..."，并把 SCHEMA_VERSION 改成 2。
+MIGRATIONS: dict[int, str] = {}
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -81,14 +87,70 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def init(conn: sqlite3.Connection) -> None:
-    """建表并写入 schema 版本。幂等。"""
-    conn.executescript(_DDL)
+def _read_schema_version(conn: sqlite3.Connection) -> int | None:
+    """读 meta.schema_version。库还没建表（全新库）时返回 None。"""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # meta 表还不存在 → 全新库
+    if row is None:
+        return None
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"索引库的 schema_version 损坏：{row['value']!r}。"
+            f"请从 Markdown 真相源运行 index --rebuild 重建索引。"
+        ) from exc
+
+
+def _write_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(SCHEMA_VERSION),),
+        (str(version),),
     )
+
+
+def init(conn: sqlite3.Connection) -> None:
+    """建表并把 schema 升到当前版本。幂等。
+
+    三种情况分开处理：
+
+    - **全新库**（没有 meta 表，或没写过版本）→ 建表，写入当前版本
+    - **库版本 < 代码版本** → 逐级跑 MIGRATIONS
+    - **库版本 > 代码版本** → **报错**。库比代码新，说明用旧代码打开了新库；
+      继续跑就是拿旧结构去读新数据，而损坏是静默的。
+    """
+    current = _read_schema_version(conn)
+
+    if current is None:
+        conn.executescript(_DDL)
+        _write_schema_version(conn, SCHEMA_VERSION)
+        conn.commit()
+        return
+
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"索引库的 schema 版本（{current}）高于本代码支持的版本（{SCHEMA_VERSION}）。"
+            f"请升级 memory-agent，或改用匹配版本的代码。"
+            f"继续运行会用旧结构读新库，可能静默损坏数据。"
+        )
+
+    if current < SCHEMA_VERSION:
+        for v in range(current, SCHEMA_VERSION):
+            script = MIGRATIONS.get(v)
+            if script is None:
+                raise RuntimeError(f"缺少 v{v} → v{v + 1} 的迁移脚本")
+            conn.executescript(script)
+        _write_schema_version(conn, SCHEMA_VERSION)
+        conn.commit()
+        return
+
+    # 版本一致：仍跑一遍 DDL（全部 IF NOT EXISTS），保证表齐全
+    conn.executescript(_DDL)
     conn.commit()
 
 
@@ -107,14 +169,18 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
     """写入或更新一张卡，并同步 FTS 索引。
 
     返回 ``"inserted"`` / ``"updated"`` / ``"unchanged"``。
-    ``unchanged`` 表示 content_hash 未变，跳过写入 —— 这是增量索引的关键。
+    ``unchanged`` 表示 file_hash 未变，跳过写入 —— 这是增量索引的关键。
+
+    注：入库的 ``card`` 字典用 ``file_hash`` 作为键（来源是 importer），
+    而 DB 列名仍是历史命名 ``content_hash``，两者刻意不统一 ——
+    改列名要迁移，收益为零。
     """
     rel = card["rel_path"]
     row = conn.execute(
         "SELECT id, content_hash FROM cards WHERE rel_path = ?", (rel,)
     ).fetchone()
 
-    if row is not None and row["content_hash"] == card.get("content_hash", ""):
+    if row is not None and row["content_hash"] == card.get("file_hash", ""):
         return "unchanged"
 
     fields = (
@@ -126,7 +192,7 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
         card.get("created", ""),
         card.get("updated", ""),
         card.get("body", ""),
-        card.get("content_hash", ""),
+        card.get("file_hash", ""),
     )
 
     if row is not None:

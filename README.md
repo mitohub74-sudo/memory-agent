@@ -63,6 +63,32 @@ agent 会话 ──采集端──> 记忆源（Markdown）──索引端──
 | 索引库 | `--db` | `MEMORY_AGENT_DB` | `db` |
 | vault | `--vault` | `MEMORY_AGENT_VAULT` | `vault` |
 
+## 安装
+
+需要 Python 3.10+，运行期**不安装任何第三方依赖**：
+
+```bash
+pip install .
+memory --help
+```
+
+开发时可安装测试与静态检查工具（只属于开发依赖，不进入运行路径）：
+
+```bash
+pip install -e ".[dev]"
+python -m pytest tests/ -q
+python -m ruff check .
+```
+
+即使不安装包，也保留从仓库直跑的路径：
+
+```bash
+python memory.py mcp
+python tests/test_mcp.py
+```
+
+---
+
 ## 接口
 
 ```bash

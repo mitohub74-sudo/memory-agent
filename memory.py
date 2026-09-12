@@ -38,6 +38,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcore import capture, config, importer, mcp_server, search, store  # noqa: E402
+from mcore.version import __version__  # noqa: E402
 
 
 def _emit(payload: dict | list, as_json: bool, render) -> None:
@@ -309,6 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="memory-agent —— 面向大模型的本地记忆检索（Markdown 为真相源）",
     )
     p.add_argument("--db", help="索引库路径（默认取 ~/.memory_agent/memory.db）")
+    p.add_argument("--version", action="version",
+                   version=f"memory-agent {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
     pp = sub.add_parser("paths", help="显示当前生效的路径")

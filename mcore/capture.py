@@ -141,18 +141,24 @@ def write_card(
     directory = vault / KIND_DIRS[kind]
 
     slug = slugify(title)
-    content_hash = hashlib.sha256(f"{title}\n{body}".encode("utf-8")).hexdigest()[:16]
+    # 卡片指纹：由「标题 + 正文」算出，与 importer 的 file_hash（整份文件文本）
+    # 不是一回事，所以名字必须区分开。
+    card_fingerprint = hashlib.sha256(
+        f"{title}\n{body}".encode("utf-8")
+    ).hexdigest()[:16]
 
-    # 幂等检查：同 slug 且正文哈希一致 -> 视为重复
+    # 幂等检查：同 slug 且指纹一致 -> 视为重复
+    # 注意：写进文件的标记字符串仍是 ``contentHash``，不随变量改名而变 ——
+    # 改了它，磁盘上既有卡片的标记就再也匹配不上。
     for existing in sorted(directory.glob(f"{slug}*.md")):
         try:
             text = existing.read_text(encoding="utf-8")
         except Exception:
             continue
-        marker = f"contentHash: {content_hash}"
+        marker = f"contentHash: {card_fingerprint}"
         if marker in text or hashlib.sha256(
             f"{title}\n{text.split('---', 2)[-1].strip()}".encode("utf-8")
-        ).hexdigest()[:16] == content_hash:
+        ).hexdigest()[:16] == card_fingerprint:
             return {"ok": True, "action": "unchanged",
                     "path": str(existing), "reason": "内容相同，已存在"}
 
@@ -161,8 +167,8 @@ def write_card(
 
     text = _render(title, body, kind, tags or [], source, status, severity,
                    reason, _now_iso())
-    # 内容哈希写进注释，供下次幂等比对
-    text = text.rstrip("\n") + f"\n\n<!-- contentHash: {content_hash} -->\n"
+    # 指纹写进注释，供下次幂等比对（标记名保持 contentHash 不变）
+    text = text.rstrip("\n") + f"\n\n<!-- contentHash: {card_fingerprint} -->\n"
 
     # 原子写入：先写临时文件再改名，避免中途失败留下半截文件
     tmp = path.with_suffix(".md.tmp")

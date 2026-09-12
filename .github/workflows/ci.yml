@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 零依赖路径：不装任何项目依赖也必须能跑。
+      - name: Run standalone protocol tests
+        run: python tests/test_mcp.py
+
+      # 开发路径：安装可选工具后，pytest 与 ruff 也必须通过。
+      - name: Install development tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run pytest suite
+        run: python -m pytest tests/ -q
+      - name: Run ruff
+        run: python -m ruff check .

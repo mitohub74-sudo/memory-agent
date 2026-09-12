@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-agent"
+description = "面向 AI agent 的本地记忆检索：Markdown 为真相源，SQLite 为可重建索引，MCP 为查询端"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["agent", "memory", "markdown", "sqlite", "fts5", "mcp", "local-first"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+# 显式零运行依赖：运行期只用 Python 标准库。
+dependencies = []
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/mitohub74-sudo/memory-agent"
+
+[project.scripts]
+memory = "memory:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.setuptools]
+py-modules = ["memory"]
+
+[tool.setuptools.packages.find]
+include = ["mcore*"]
+
+# 版本号单一来源 —— 与 mcore/version.py 同源，不在这里再写一遍。
+[tool.setuptools.dynamic]
+version = { attr = "mcore.version.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E501 交给 formatter；中文注释天然容易超长，逐行折反而更难读。
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

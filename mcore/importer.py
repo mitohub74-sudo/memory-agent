@@ -2,7 +2,7 @@
 """vault → SQLite 导入器。
 
 Markdown 是真相源，本模块负责把它读进索引。特点是**增量**：
-用 content_hash 比对，内容没变的卡片直接跳过，不重复写库。
+用 file_hash 比对，内容没变的卡片直接跳过，不重复写库。
 
 frontmatter 解析刻意不引入 PyYAML —— 只支持本项目实际用到的极简子集
 （``key: value`` 标量与 ``[a, b]`` 内联数组），保持零依赖。
@@ -103,7 +103,10 @@ def build_card(vault: Path, path: Path) -> dict:
         "created": str(meta.get("created", "")),
         "updated": str(meta.get("updated", "")),
         "body": body,
-        "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        # file_hash = 整份文件文本（含 frontmatter）的哈希，用于增量比对。
+        # 与 capture 的 card_fingerprint（标题+正文）是两个不同的东西，
+        # 名字必须区分，否则很容易误读成同一个值。
+        "file_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
     }
 
 

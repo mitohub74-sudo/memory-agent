@@ -15,7 +15,10 @@
 3. **零外部依赖**，仅用 Python 标准库。
 """
 
+from .version import __version__  # noqa: F401  —— 对外暴露 mcore.__version__
 from . import capture, config, importer, mcp_server, search, store, tokenize
 
-__all__ = ["config", "store", "tokenize", "importer", "search", "capture", "mcp_server"]
-__version__ = "0.4.0"
+__all__ = [
+    "config", "store", "tokenize", "importer", "search", "capture", "mcp_server",
+    "__version__",
+]

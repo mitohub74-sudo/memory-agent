@@ -15,12 +15,35 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MEMORY_PY = ROOT / "memory.py"
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# 测试语料：**合成数据，不是用户记忆**。
+# 测试必须在任何机器上都得到同一个结果 —— 依赖调用者的真实 vault 时，
+# 干净环境（CI、新克隆）会因为「语料不存在」而失败，那是测试的缺陷，不是产品的。
+CORPUS_CARDS = [
+    {
+        "title": "示例服务器登录方式",
+        "body": "示例主机使用密钥登录，密钥位于 ~/.ssh/id_ed25519_example，"
+                "SSH 别名为 example-host。修改 web 服务配置后需执行 reload 才生效。",
+        "kind": "knowledge",
+    },
+    {
+        "title": "示例环境部署记录",
+        "body": "示例环境部署在 10.0.0.1，部署脚本只记录示例路径与示例命令，"
+                "用于验证检索链路是否可用。",
+        "kind": "project",
+    },
+]
 
 _passed = 0
 _failed: list[str] = []
@@ -113,11 +136,47 @@ class Client:
         return self.proc.stderr.read()
 
 
+def _env_for(root: Path) -> dict:
+    """把一次测试运行隔离到独立 vault + 独立库，绝不触碰真实记忆。"""
+    return {
+        "MEMORY_AGENT_VAULT": str(root / "vault"),
+        "MEMORY_AGENT_DB": str(root / "memory.db"),
+    }
+
+
+def _seed(root: Path) -> None:
+    """把合成语料写入隔离 vault 并建索引。
+
+    用仓库自身的 ``capture`` 写入，而不是手拼 Markdown —— 手拼的格式迟早与
+    真实写入路径漂移，那时测试覆盖的就不是产品行为。
+    """
+    from mcore import capture, importer, store
+
+    vault = root / "vault"
+    db = root / "memory.db"
+    for card in CORPUS_CARDS:
+        result = capture.write_card(vault, title=card["title"], body=card["body"],
+                                    kind=card["kind"])
+        if result.get("action") != "created":
+            raise RuntimeError(f"种子语料写入失败：{result}")
+
+    conn = store.connect(db)
+    try:
+        store.init(conn)
+        importer.sync(conn, vault)
+    finally:
+        conn.close()
+
+
 def main() -> int:
     print("MCP server 协议测试")
     print("=" * 62)
 
-    c = Client()
+    # 全程使用合成语料（CORPUS_CARDS），不读调用者的真实 vault。
+    tmp0 = Path(tempfile.mkdtemp(prefix="memory-agent-corpus-"))
+    _seed(tmp0)
+
+    c = Client(env=_env_for(tmp0))
     try:
         # ---------------------------------------------------- 握手
         print("\n[1] 初始化握手")
@@ -133,6 +192,12 @@ def main() -> int:
         check("声明 tools 能力", "tools" in res.get("capabilities", {}))
         check("返回 serverInfo", res.get("serverInfo", {}).get("name") == "memory-agent",
               str(res.get("serverInfo")))
+        # 走包内导入而不是子进程输出，才能证明「同一个版本号来源」。
+        # mcore 不能在文件顶部导入 —— 直跑模式下 sys.path 到 main() 才就绪。
+        from mcore.version import __version__ as PKG_VERSION
+        check("serverInfo.version 与包版本同源",
+              res.get("serverInfo", {}).get("version") == PKG_VERSION,
+              f"{res.get('serverInfo', {}).get('version')} vs {PKG_VERSION}")
         c.notify("notifications/initialized")
 
         # ---------------------------------------------------- 版本降级
@@ -163,7 +228,9 @@ def main() -> int:
         text = content[0]["text"] if content else ""
         check("返回 content 数组", bool(content))
         check("content type 为 text", content and content[0].get("type") == "text")
-        check("检索到内容", "命中" in text and "命中 0" not in text, text[:120])
+        # 合成语料里恰好一张卡含「密钥」—— 所以这里能断言**精确条数**，
+        # 而不是「命中不为 0」。精确断言才能发现召回变宽/变窄。
+        check("合成语料中「密钥」精确命中 1 条", "命中 1 条" in text, text[:120])
         check("未标记为错误", not r4.get("result", {}).get("isError"))
 
         # 从结果里抠出 id，供下一步用
@@ -187,7 +254,9 @@ def main() -> int:
             stats = json.loads(t6)
             check("stats 返回合法 JSON", True)
             check("stats 含 total 字段", "total" in stats, str(stats)[:120])
-            check("卡片数 > 0", stats.get("total", 0) > 0, str(stats.get("total")))
+            check("卡片数等于合成语料规模",
+                  stats.get("total") == len(CORPUS_CARDS),
+                  f"{stats.get('total')} vs {len(CORPUS_CARDS)}")
         except json.JSONDecodeError:
             check("stats 返回合法 JSON", False, t6[:120])
 
@@ -214,7 +283,6 @@ def main() -> int:
 
         # ---------------------------------------------------- 采集端
         print("\n[8] 采集端闭环（隔离到临时 vault，不碰真实记忆）")
-        import tempfile
         tmp = tempfile.mkdtemp(prefix="memory-agent-test-")
         c2 = Client(env={
             "MEMORY_AGENT_VAULT": str(Path(tmp) / "vault"),
@@ -284,7 +352,6 @@ def main() -> int:
                   files and "登录" in files[0].name, files[0].name if files else "")
         finally:
             c2.close()
-            import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
         # ---------------------------------------------------- 检索档位
@@ -362,8 +429,10 @@ def main() -> int:
               repr(stderr[:80]))
 
     except Exception as exc:
-        check(f"测试过程中未抛异常", False, str(exc))
+        check("测试过程中未抛异常", False, str(exc))
         c.proc.kill()
+    finally:
+        shutil.rmtree(tmp0, ignore_errors=True)
 
     print("\n" + "=" * 62)
     total = _passed + len(_failed)
@@ -375,6 +444,13 @@ def main() -> int:
         return 1
     print("全部通过。")
     return 0
+
+
+def test_mcp_protocol() -> None:
+    """pytest 入口：复用同一份协议级 harness，不使用 fixture。"""
+    from tests._runner import require_success
+
+    require_success(main())
 
 
 if __name__ == "__main__":

@@ -52,8 +52,12 @@ __all__ = [
 # 又不至于让真正卡死的情况无限等下去。P3-01 的全量迁移也是在这个窗口内完成的。
 BUSY_TIMEOUT_MS = 5000
 
+# SQLite 的参数个数上限（``SQLITE_MAX_VARIABLE_NUMBER``）。3.32 起默认 32766，
+# 但更早的版本是 999，而本项目的底线是 Python 3.10 自带的 SQLite —— 按 999 切分
+# 才是安全的。批量化删除时用它算分块大小。
+SQLITE_MAX_VARIABLES = 999
+
 # 锁重试计划（秒）。**这不是随手取的退避**，而是针对一个具体机制的修正：
-#
 # ``busy_timeout`` 只在「等一个会自己释放的锁」时生效。而 ``_init_once`` 里
 # 「先读 meta 拿 schema_version、再执行 DDL」是**读事务升级为写事务**；
 # 一旦此时别的进程正持有写锁，SQLite 会**立即**返回 SQLITE_BUSY，
@@ -526,20 +530,39 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
 def delete_cards(conn: sqlite3.Connection, rel_paths: list[str]) -> int:
     """按路径批量删除卡片及其索引行。返回删除数量。
 
-    **不删 card_stats** —— 统计记的是「这张卡被读过多少次」，
-    只在卡片真的离开 vault 时才该失去意义。当前删除的唯一来源是
-    「文件已不在 vault」，那时 P3-07 会连同统计一起清理（批量化时一起做）。
+    **批量化**：原来是一张卡三条语句（SELECT id、删 FTS、删 cards），删除 N 张
+    就是 3N 次往返。SQLite 的参数上限是 **999**（编译期 ``SQLITE_MAX_VARIABLE_NUMBER``，
+    老版本更低），所以按块切分而不是一次性拼一整个 IN 列表 —— 超限会直接报错。
+
+    **同时清 card_stats**：卡片真的离开 vault 之后，它的读取次数已经没有任何意义，
+    留着就是「永远读不出来的幽灵行」（join cards 时消失，但确实占着表）。
+    注意软删（P3-02 的 `.trash`）是**可恢复**的，那条路径不该走这个函数 ——
+    统计要留到真正销毁（``delete --purge``）时才丢。
     """
+    rels = [r for r in dict.fromkeys(rel_paths) if r]  # 去重且保序
+    if not rels:
+        return 0
+
+    # 留出余量：每个 chunk 用 1 个参数查 id + 1 个参数查 stats。
+    chunk_size = (SQLITE_MAX_VARIABLES - 1) // 2
     n = 0
-    for rel in rel_paths:
-        row = conn.execute(
-            "SELECT id FROM cards WHERE rel_path = ?", (rel,)
-        ).fetchone()
-        if row is None:
+    for start in range(0, len(rels), chunk_size):
+        chunk = rels[start : start + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        ids = [
+            int(r["id"]) for r in conn.execute(
+                f"SELECT id FROM cards WHERE rel_path IN ({placeholders})", chunk
+            )
+        ]
+        if not ids:
             continue
-        conn.execute("DELETE FROM cards_fts WHERE rowid = ?", (row["id"],))
-        conn.execute("DELETE FROM cards WHERE id = ?", (row["id"],))
-        n += 1
+        id_ph = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM cards_fts WHERE rowid IN ({id_ph})", ids)
+        conn.execute(f"DELETE FROM cards WHERE id IN ({id_ph})", ids)
+        conn.execute(
+            f"DELETE FROM card_stats WHERE rel_path IN ({placeholders})", chunk
+        )
+        n += len(ids)
     return n
 
 

@@ -189,6 +189,97 @@ def test_v1_database_migrates_to_v2_and_keeps_data() -> None:
             conn.close()
 
 
+def test_batch_delete_keeps_both_tables_consistent() -> None:
+    """批量删除后 cards 与 cards_fts 行数必须一致，且 card_stats 一并清理。
+
+    「两表行数一致」是这一项的验收条件：只删 cards 不删 FTS，索引里就会留下
+    指向不存在卡片的残余行 —— 检索时 join 不到、看不见，但确实占着空间，
+    且会让 ``COUNT(*)`` 之类的核对得出错误结论。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-store-") as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        (vault / "03-Knowledge").mkdir(parents=True)
+        for i in range(6):
+            (vault / "03-Knowledge" / f"批量卡{i}.md").write_text(
+                f"---\ntitle: 批量卡{i}\nkind: knowledge\n---\n\n第 {i} 张批量删除测试卡的正文。\n",
+                encoding="utf-8",
+            )
+
+        conn = store.connect(root / "memory.db")
+        try:
+            store.init(conn)
+            importer.sync(conn, vault)
+            assert store.count_cards(conn) == 6
+
+            rels = [f"03-Knowledge/批量卡{i}.md" for i in range(6)]
+            # 每张卡都留一条访问记录，用于验证统计被一起清掉
+            store.record_access(conn, rels, now=1_700_000_000)
+
+            def fts_count() -> int:
+                return int(conn.execute("SELECT COUNT(*) FROM cards_fts").fetchone()[0])
+
+            assert fts_count() == 6
+
+            # 删 3 张（含重复项与不存在的路径，验证去重与容错）
+            n = store.delete_cards(conn, rels[:2] + [rels[1], "99-No/不存在.md"])
+            assert n == 2, n
+            assert store.count_cards(conn) == 4
+            assert fts_count() == 4, "FTS 必须与 cards 同步删除"
+
+            # 统计随卡片一起清掉（真删），不留幽灵行
+            assert store.get_access_stat(conn, rels[0]) is None
+            assert store.get_access_stat(conn, rels[2]) is not None
+
+            # 再删剩余全部
+            n = store.delete_cards(conn, rels[2:])
+            assert n == 4
+            assert store.count_cards(conn) == 0
+            assert fts_count() == 0
+            assert store.access_stats(conn) == []
+
+            # 空输入是 no-op，不抛错
+            assert store.delete_cards(conn, []) == 0
+        finally:
+            conn.close()
+
+
+def test_batch_delete_chunks_beyond_parameter_limit() -> None:
+    """超过 SQLite 参数上限时必须分块，而不是拼一个超长 IN 列表。
+
+    直接拼 1200 个占位符在 SQLite 3.32+ 尚可（上限 32766），但在更老的构建上
+    会直接报 "too many SQL variables"。本项目的底线是 Python 3.10 自带的 SQLite，
+    所以按 999 分块才是安全的 —— 这条测试用「远小于真实上限但远大于分块」的数量
+    把分块逻辑本身钉住。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-store-") as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        (vault / "03-Knowledge").mkdir(parents=True)
+
+        total = 1100  # 明显超过 999
+        for i in range(total):
+            (vault / "03-Knowledge" / f"chunk{i:04d}.md").write_text(
+                f"---\ntitle: 分块卡{i}\nkind: knowledge\n---\n\n分块删除测试卡 {i} 的正文内容。\n",
+                encoding="utf-8",
+            )
+        rels = [f"03-Knowledge/chunk{i:04d}.md" for i in range(total)]
+
+        conn = store.connect(root / "memory.db")
+        try:
+            store.init(conn)
+            importer.sync(conn, vault)
+            assert store.count_cards(conn) == total
+
+            n = store.delete_cards(conn, rels)
+            assert n == total, n
+            assert store.count_cards(conn) == 0
+            fts = conn.execute("SELECT COUNT(*) FROM cards_fts").fetchone()[0]
+            assert int(fts) == 0, "分块删除后 FTS 也必须清空"
+        finally:
+            conn.close()
+
+
 def test_read_path_survives_unmigrated_v1_database() -> None:
     """读路径不能在还没迁移的旧库上炸掉。
 

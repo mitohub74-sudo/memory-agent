@@ -44,6 +44,7 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcore import capture, config, importer, mcp_server, readtext, search, store  # noqa: E402
+from mcore.util import parse_tags  # noqa: E402
 from mcore.version import __version__  # noqa: E402
 
 
@@ -281,7 +282,9 @@ def cmd_capture(args) -> int:
     if not body and not sys.stdin.isatty():
         body = sys.stdin.read()
 
-    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    # 与 MCP 的 memory_capture 共用同一个解析实现（util.parse_tags），
+    # 两个入口不能各写一份 —— 那正是 P1 分叉的成因。
+    tags = parse_tags(args.tags)
     vault = config.vault_path(args.vault)
 
     result = capture.write_card(

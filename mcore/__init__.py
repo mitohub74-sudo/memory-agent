@@ -16,9 +16,9 @@
 """
 
 from .version import __version__  # noqa: F401  —— 对外暴露 mcore.__version__
-from . import capture, config, importer, mcp_server, search, store, tokenize
+from . import capture, config, importer, mcp_server, readtext, search, store, tokenize, util
 
 __all__ = [
     "config", "store", "tokenize", "importer", "search", "capture", "mcp_server",
-    "__version__",
+    "readtext", "util", "__version__",
 ]

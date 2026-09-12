@@ -26,6 +26,7 @@ import sys
 from typing import Any
 
 from . import capture, config, importer, readtext, search, store
+from .util import parse_tags
 from .version import __version__ as SERVER_VERSION
 
 __all__ = ["SUPPORTED_PROTOCOL_VERSIONS", "DEFAULT_PROTOCOL_VERSION", "TOOLS", "serve"]
@@ -357,9 +358,8 @@ class MemoryServer:
         if not title or not body:
             return _err("title 与 body 均为必填。")
 
-        tags = args.get("tags") or []
-        if not isinstance(tags, list):
-            tags = [t.strip() for t in str(tags).split(",") if t.strip()]
+        # 与 CLI 的 capture 共用同一个解析实现（util.parse_tags）。
+        tags = parse_tags(args.get("tags"))
 
         vault = config.vault_path()
         result = capture.write_card(

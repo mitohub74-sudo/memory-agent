@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .store import delete_cards, retry_on_locked, upsert_card
 from .store import commit as store_commit
+from .util import parse_tags
 
 __all__ = ["parse_frontmatter", "build_card", "sync", "sync_one"]
 
@@ -145,9 +146,8 @@ def build_card(vault: Path, path: Path) -> dict:
     title = str(meta.get("title") or "").strip() or _first_heading(body) or path.stem
     body = _strip_duplicate_heading(body, title)
 
-    tags = meta.get("tags", [])
-    if not isinstance(tags, list):
-        tags = [t.strip() for t in str(tags).split(",") if t.strip()]
+    # tags 的解析收口在 util.parse_tags —— 原先三处各写一份且 list 路径行为不同。
+    tags = parse_tags(meta.get("tags", []))
 
     ttl_raw = str(meta.get("ttl", "") or "")
 

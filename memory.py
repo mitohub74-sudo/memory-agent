@@ -27,11 +27,17 @@ import json
 import sys
 from pathlib import Path
 
-# Windows 控制台默认不是 UTF-8
-if hasattr(sys.stdout, "reconfigure"):
+# Windows 控制台默认不是 UTF-8。**三个流都要改**：只改 stdout/stderr 时，
+# 写出去的干净、读进来的已经烂了 —— 中文系统上 stdin 按 cp936 解码，
+# 管道喂进来的 UTF-8 正文会变成乱码，再编码时直接抛
+# UnicodeEncodeError: surrogates not allowed（capture 读 stdin 就踩过这个坑）。
+# errors="surrogateescape" 是防弹衣：宁愿留替换字符，也不让整个进程崩掉。
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is None:
+        continue
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        _reconfigure(encoding="utf-8", errors="surrogateescape")
     except Exception:
         pass
 

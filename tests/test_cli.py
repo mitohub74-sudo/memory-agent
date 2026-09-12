@@ -34,7 +34,56 @@ def _run(env: dict, *argv: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_cli_capture_reads_utf8_body_from_stdin() -> None:
+    """管道喂进来的中文正文必须原样入库。
+
+    这是一个真实踩过的坑：Windows 上 ``sys.stdin`` 默认按区域编码（中文系统是
+    cp936）解码。只把 stdout/stderr 改成 UTF-8 是不够的 —— 写出去的干净、
+    读进来的已经烂了，最后在 ``capture.write_card`` 里炸成
+    ``UnicodeEncodeError: surrogates not allowed``。
+
+    所以这里**用字节管道**喂 UTF-8，并逐字校验落盘内容，而不是只看退出码。
+    """
+    with tempfile.TemporaryDirectory(prefix="memory-agent-cli-") as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        env = {
+            "MEMORY_AGENT_VAULT": str(vault),
+            "MEMORY_AGENT_DB": str(root / "memory.db"),
+        }
+        title = "中文标题：ECS 登录方式"
+        body = "正文含中文与符号：私钥 id_ed25519、别名 ecs-prod、「引号」与破折号——都要原样保留。"
+
+        full_env = dict(os.environ)
+        full_env.update(env)
+        proc = subprocess.run(
+            [sys.executable, str(MEMORY_PY), "capture",
+             "--title", title, "--kind", "knowledge", "--json"],
+            input=body.encode("utf-8"),
+            capture_output=True,
+            cwd=str(ROOT),
+            env=full_env,
+        )
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+        payload = json.loads(proc.stdout.decode("utf-8"))
+        assert payload["action"] == "created", payload
+        assert payload["indexed"] is True, payload
+
+        written = Path(payload["path"]).read_text(encoding="utf-8")
+        assert title in written, "标题必须原样落盘，不能是乱码"
+        assert body in written, "正文必须原样落盘，不能是乱码"
+
+        # 落盘对了还不够：必须真的能搜到（写入即索引）
+        r = _run(env, "search", "ecs-prod", "--json")
+        assert r.returncode == 0, f"写入后应立刻可检索：{r.stdout} {r.stderr}"
+
+
 def test_access_stats_survive_index_rebuild_via_cli() -> None:
+    """``index --rebuild`` 之后访问统计必须还在。
+
+    ``card_stats`` 没有第二个来源 —— 它一旦跟着 rebuild 走，统计就是永久丢失。
+    """
     with tempfile.TemporaryDirectory(prefix="memory-agent-cli-") as raw:
         root = Path(raw)
         vault = root / "vault"

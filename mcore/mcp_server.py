@@ -361,8 +361,34 @@ class MemoryServer:
             return _err(f"工具执行失败：{exc}")
 
 
+def _force_utf8_streams() -> None:
+    """把 stdio 三个流都钉成 UTF-8。
+
+    为什么三个都要：Windows 上 ``sys.stdin`` 默认按**区域编码**（中文系统是
+    cp936）解码，而协议里的中文卡片标题与正文是 UTF-8 字节 —— 不解码对，
+    轻则乱码入库，重则 ``UnicodeEncodeError: surrogates not allowed`` 直接把
+    服务打挂。只改 stdout/stderr 是不够的：写出去的干净，读进来的已经烂了。
+
+    ``errors="surrogateescape"`` 是防弹衣：万一真的来了非法字节，
+    宁可留下替换字符，也不让整个进程崩掉。
+    """
+    for stream, kwargs in (
+        (sys.stdin, {"errors": "surrogateescape"}),
+        (sys.stdout, {"errors": "surrogateescape"}),
+        (sys.stderr, {"errors": "surrogateescape"}),
+    ):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", **kwargs)
+        except Exception:  # 流被重定向成非文本对象时保持原样
+            pass
+
+
 def serve() -> int:
     """stdio 主循环。"""
+    _force_utf8_streams()
     server = MemoryServer()
     write = sys.stdout.write
     flush = sys.stdout.flush

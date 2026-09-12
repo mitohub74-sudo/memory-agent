@@ -33,7 +33,6 @@ __all__ = [
     "upsert_card",
     "delete_cards",
     "get_card",
-    "iter_cards",
     "count_cards",
     "stats",
     "record_access",
@@ -568,10 +567,6 @@ def delete_cards(conn: sqlite3.Connection, rel_paths: list[str]) -> int:
 
 def get_card(conn: sqlite3.Connection, card_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-
-
-def iter_cards(conn: sqlite3.Connection):
-    return conn.execute("SELECT * FROM cards ORDER BY rel_path")
 
 
 def count_cards(conn: sqlite3.Connection) -> int:

@@ -280,6 +280,31 @@ def test_batch_delete_chunks_beyond_parameter_limit() -> None:
             conn.close()
 
 
+def test_store_does_not_expose_dead_api() -> None:
+    """store 的公开 API 里不该有**无调用方**的函数（P4-11）。
+
+    ``iter_cards`` 曾经被导出但没有任何调用方 —— 它不影响功能，却有两个真实代价：
+    读者会以为它是**约定好的遍历入口**（于是新代码绕开真正的查询路径去用它），
+    以及它让「哪些函数是活的」这件事需要靠搜索才能确认。
+
+    ROADMAP 的处置口径是「P3 的 export 用到则保留加测试，否则删除」。export 从未实现，
+    所以删除。这条测试是**反向护栏**：若以后有人重新加一个没人用的导出，
+    只要它不进这份白名单就会被发现 —— 白名单本身就是「这些都是有调用方或有测试的」的声明。
+    """
+    import inspect
+
+    from mcore import store
+
+    public = {n for n in store.__all__ if not n.startswith("_")}
+    assert "iter_cards" not in public, "无调用方的 iter_cards 不应重新出现在公开 API 里"
+
+    # 白名单里的每一项都必须真的存在（防止拼写错误让护栏变成空转）
+    for name in public:
+        assert hasattr(store, name), f"__all__ 声明了不存在的 {name}"
+        obj = getattr(store, name)
+        assert inspect.isclass(obj) or callable(obj) or isinstance(obj, (dict, str, int)), name
+
+
 def test_read_path_survives_unmigrated_v1_database() -> None:
     """读路径不能在还没迁移的旧库上炸掉。
 

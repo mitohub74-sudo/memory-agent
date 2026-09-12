@@ -287,10 +287,18 @@ class MemoryServer:
         mode = _MODE_LABEL.get(hits[0].matched, hits[0].matched)
         lines = [f"命中 {len(hits)} 条  (query={query}, 匹配模式={mode})", ""]
         for i, h in enumerate(hits, 1):
+            # 覆盖率只在放宽档显示：精确档恒为 1.0，写出来只是噪音。
+            cover = "" if h.matched in ("all", "all-prefix") else f"  覆盖率={h.coverage:.0%}"
             lines.append(f"[{i}] id={h.card_id}  {h.title}")
-            lines.append(f"    {h.rel_path}  kind={h.kind}  source={h.source}")
+            lines.append(f"    {h.rel_path}  kind={h.kind}  source={h.source}{cover}")
             if h.snippet:
                 lines.append(f"    {h.snippet}")
+            lines.append("")
+        # 低置信提示放在末尾：它是对整批结果的判断，不属于某一列。
+        # 这段话的作用是让调用方能**自己判断该不该信**，而不是替它重排结果。
+        note = search.low_confidence_note(hits[0].matched, hits[0].coverage)
+        if note:
+            lines.append(note)
             lines.append("")
         lines.append("展开全文：memory_get(id=<id>)")
         return _ok("\n".join(lines))

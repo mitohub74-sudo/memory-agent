@@ -524,6 +524,12 @@ def main() -> int:
             loose = hits("sqlite3 requests zzznotexist")
             check("AND 无法满足时降级到 OR", "OR" in loose)
             check("降级后召回更宽（命中 2）", "命中 2" in loose)
+            # 放宽档必须给出覆盖率与低置信提示 —— 让调用方能自己判断该不该信这批结果。
+            # 精确档则不该显示覆盖率（恒为 1.0，写出来只是噪音）。
+            check("放宽档显示覆盖率", "覆盖率=" in loose, loose[:400])
+            check("放宽档给出低置信提示",
+                  "置信度偏低" in loose or "放宽档" in loose, loose[-300:])
+            check("精确档不显示覆盖率", "覆盖率=" not in hits("sqlite3"), hits("sqlite3")[:300])
         finally:
             c3.close()
             shutil.rmtree(tmp3, ignore_errors=True)

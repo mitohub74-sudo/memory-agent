@@ -133,6 +133,10 @@ def cmd_search(args) -> int:
         "ok": bool(hits),
         "query": args.query,
         "count": len(hits),
+        # 低置信提示：对整批结果的判断，让调用方知道该不该信这批结果。
+        # coverage 只反映「命中了多少查询词」，**没有参与排序**（见 search.Hit 的说明）。
+        "confidence_note": (search.low_confidence_note(hits[0].matched, hits[0].coverage)
+                            if hits else ""),
         "results": [
             {
                 "id": h.card_id,
@@ -142,6 +146,7 @@ def cmd_search(args) -> int:
                 "source": h.source,
                 "score": round(h.score, 4),
                 "matched": h.matched,
+                "coverage": h.coverage,
                 "snippet": h.snippet,
             }
             for h in hits
@@ -153,10 +158,14 @@ def cmd_search(args) -> int:
             print(f"未命中：{d['query']}")
             return
         for i, r in enumerate(d["results"], 1):
-            print(f"{i}. [{r['score']:.3f}] {r['title']}  (id={r['id']})")
+            # 精确档覆盖率恒为 1.0，显示出来只是噪音，所以只在放宽档显示。
+            cover = "" if r["matched"] in ("all", "all-prefix") else f"  覆盖率={r['coverage']:.0%}"
+            print(f"{i}. [{r['score']:.3f}] {r['title']}  (id={r['id']}){cover}")
             print(f"   {r['path']}  {r['kind']}  {r['source']}")
             if r["snippet"]:
                 print(f"   {r['snippet']}")
+        if d["confidence_note"]:
+            print(f"\n{d['confidence_note']}")
 
     _emit(payload, args.json, render)
     return 0 if hits else 1

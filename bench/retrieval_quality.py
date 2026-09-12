@@ -53,7 +53,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from mcore import config, search  # noqa: E402
+# 与 memory.py 同一处理：Windows 上 stdout 默认按区域编码（中文系统 cp936），
+# 而这个脚本会印大量中文（查询名、档位、说明）。**直跑本文件时没有任何上层
+# 帮忙配置**，于是输出会是 cpython 按 cp936 编码的字节 —— 管道读取方按 UTF-8 解
+# 直接报 UnicodeDecodeError（测试里实测到了）。作为独立可运行的工具，
+# 它得自己保证输出编码。
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is None:
+        continue
+    try:
+        _reconfigure(encoding="utf-8", errors="surrogateescape")
+    except Exception:  # 流被重定向成非文本对象时保持原样
+        pass
+
+from mcore import config, fingerprint, search  # noqa: E402
 
 DEFAULT_QUERIES = "bench_queries.json"
 
@@ -228,6 +242,11 @@ def main(argv: list[str] | None = None) -> int:
         "queries_file": str(qfile),
         "cards": len(cards),
         "limit": args.limit,
+        # 影响召回的参数指纹（见 mcore/fingerprint.py）。存进基线之后，
+        # 下次比对就能区分「分数变了」与「尺子变了」—— 后者意味着两次比较的前提不同，
+        # 分数差异根本无法归因，此时报「前提已变」比报分数更诚实。
+        "fingerprint": fingerprint.fingerprint(),
+        "fp_parts": fingerprint.fingerprint_parts(),
         "aggregate": agg,
         "by_group": groups,
         "per_query": rows,
@@ -239,8 +258,37 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     regressed: list[str] = []
+    premise_changed: list[str] = []
     if args.baseline:
         base = json.loads(Path(args.baseline).expanduser().read_text(encoding="utf-8"))
+
+        # 先比前提，再比分数。前提不同时分数差异不可归因 —— 这时**先说什么变了**，
+        # 而不是先报一堆分数差让人去猜。老基线没有指纹字段时明确说明「无法核对」，
+        # 不假装一致（假装一致就等于给出一个假的「前提未变」结论）。
+        old_fp = base.get("fingerprint")
+        if old_fp is None:
+            premise_changed.append(
+                "基线未记录参数指纹（老格式），无法核对比较前提是否一致 —— "
+                "请用 --save 重新冻结基线"
+            )
+        elif old_fp != payload["fingerprint"]:
+            detail = []
+            old_parts = base.get("fp_parts", {})
+            for key, val in payload["fp_parts"].items():
+                if old_parts.get(key) != val:
+                    detail.append(f"{key} {old_parts.get(key, '—')} → {val}")
+            premise_changed.append(
+                "比较前提已变：影响召回的参数指纹不一致"
+                + (f"（{'; '.join(detail)}）" if detail else "")
+            )
+            # 语料规模也一并报出来：它是另一类前提（语料变了不是退化）。
+            old_cards = base.get("cards")
+            if old_cards is not None and old_cards != len(cards):
+                premise_changed.append(
+                    f"语料规模也变了：{old_cards} → {len(cards)} 张卡 —— "
+                    f"注意语料变化本身就会移动指标，这与检索退化是两件事"
+                )
+
         for scope, old_scope in (("aggregate", base.get("aggregate", {})),
                                  *[(g, base.get("by_group", {}).get(g, {}))
                                    for g in groups]):
@@ -251,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
                     regressed.append(f"[{scope}] {m}: {old} → {new}")
         payload["baseline"] = str(args.baseline)
         payload["regressed"] = regressed
+        payload["premise_changed"] = premise_changed
+        payload["baseline_cards"] = base.get("cards")
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -287,11 +337,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.baseline:
             print()
+            # 先报前提，再报分数：前提不同的话，下面那些分数差**不可归因**，
+            # 必须先让人看到这一点，否则会照着错误的线索去查代码。
+            for line in premise_changed:
+                print(f"⚠ {line}")
+            if premise_changed:
+                print("   （前提已变时，上面的分数差异不能直接当作退化或改善）")
             if regressed:
                 print("⚠ 相比基线退化：")
                 for line in regressed:
                     print(f"   {line}")
-            else:
+            elif not premise_changed:
                 print("✓ 相比基线无退化")
 
     return 1 if regressed else 0

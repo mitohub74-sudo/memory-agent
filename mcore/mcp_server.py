@@ -278,13 +278,9 @@ class MemoryServer:
         if not hits:
             return _ok(f"记忆库中没有与「{query}」相关的内容。")
 
-        _MODE_LABEL = {
-            "all": "AND 精确",
-            "all-prefix": "AND 前缀",
-            "any": "OR（已放宽）",
-            "any-prefix": "OR + 前缀（已放宽）",
-        }
-        mode = _MODE_LABEL.get(hits[0].matched, hits[0].matched)
+        # 标签来自 search.MODE_LABELS（唯一来源）—— 档位的语义定义在那边，
+        # 名字就该跟着语义走，不要在这个文件里再写一份。
+        mode = search.mode_label(hits[0].matched)
         lines = [f"命中 {len(hits)} 条  (query={query}, 匹配模式={mode})", ""]
         for i, h in enumerate(hits, 1):
             # 覆盖率只在放宽档显示：精确档恒为 1.0，写出来只是噪音。

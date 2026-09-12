@@ -24,7 +24,7 @@ from typing import Protocol, runtime_checkable
 from .tokenize import query_terms, to_query_expr
 
 __all__ = ["Hit", "Searcher", "KeywordSearcher", "MIN_LIMIT", "MAX_LIMIT", "clamp_limit",
-           "compute_coverage", "low_confidence_note"]
+           "MODE_LABELS", "mode_label", "compute_coverage", "low_confidence_note"]
 
 # 检索条数边界。CLI 与 MCP 共用同一组常量 —— 两处各写一份迟早漂移。
 MIN_LIMIT = 1
@@ -43,6 +43,33 @@ def clamp_limit(value: int | str | None) -> int:
     except (TypeError, ValueError):
         n = MIN_LIMIT
     return max(MIN_LIMIT, min(n, MAX_LIMIT))
+
+
+# 档位 → 对外标签。**这是唯一来源**，CLI 与 MCP 都从这里取。
+#
+# 为什么放在 search.py：档位的**语义**（四档、降级顺序）定义在本模块的
+# ``KeywordSearcher.TIERS`` 里。标签原本写在 ``mcp_server.py``，于是「语义在这里、
+# 名字在那里」—— 一旦新增档位或在别处也渲染档位，就会各写一份、慢慢漂移。
+# 本项目已经因为「两处各写一份」吃过两次教训（P1 的 CLI/MCP capture 分叉、
+# P3-04 的窗口实现），所以标签跟着语义走。
+#
+# 措辞里保留「已放宽」：对调用方来说，「这批结果为什么可信度低」比
+# 「用了哪个 SQL 连接词」重要得多。
+MODE_LABELS: dict[str, str] = {
+    "all": "AND 精确",
+    "all-prefix": "AND 前缀",
+    "any": "OR（已放宽）",
+    "any-prefix": "OR + 前缀（已放宽）",
+}
+
+
+def mode_label(matched: str) -> str:
+    """把档位值翻成对外标签。未登记的档位原样返回。
+
+    未知档位不抛错也不编一个名字：它是内部值，原样透出至少能让人看出
+    「这里有个没登记的档位」，而编出来的名字会掩盖这件事。
+    """
+    return MODE_LABELS.get(matched, matched)
 
 
 @dataclass

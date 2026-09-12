@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 __all__ = ["KIND_DIRS", "DEFAULT_KIND", "CONFLICT_POLICIES", "SECRET_PATTERNS",
-           "write_card", "scan_secrets", "scan_slug", "card_fingerprint", "slugify"]
+           "write_card", "supersede_card", "update_frontmatter", "scan_secrets",
+           "scan_slug", "card_fingerprint", "slugify"]
 
 # kind -> 分类目录（与既有 vault 结构一致）
 KIND_DIRS: dict[str, str] = {
@@ -132,7 +133,6 @@ _RESERVED_NAMES = frozenset(
 # 保留名清单本身就是判定依据，不再需要额外的正则。
 
 
-
 def _avoid_reserved(slug: str) -> str:
     """slug 若是 Windows 保留设备名，包一层下划线把它变成普通名字。
 
@@ -194,7 +194,18 @@ def _yaml_list(items: list[str]) -> str:
 
 
 def _render(title: str, body: str, kind: str, tags: list[str], source: str,
-            status: str, severity: str, reason: str, ts: str) -> str:
+            status: str, severity: str, reason: str, ts: str,
+            *, supersedes: str = "", invalid_at: str = "",
+            superseded_by: str = "") -> str:
+    """渲染一张卡的完整文本（frontmatter + 正文）。
+
+    取代相关的三个字段**默认不写** —— 只有在真的用到时才出现在 frontmatter 里。
+    理由：字段一多，人读卡时就要在一堆空值里找有用的那几行；而「没写」与
+    「写了空串」对读卡的人不是一回事。
+
+    注意 ``created`` 与 ``updated`` 都由 ``ts`` 决定（同一次调用的毫秒一致），
+    这是 P4-09 的结果：原来取两次时钟，跨整秒边界会产生自相矛盾的时间戳。
+    """
     fm = [
         "---",
         f"formatVersion: {FORMAT_VERSION}",
@@ -208,10 +219,173 @@ def _render(title: str, body: str, kind: str, tags: list[str], source: str,
         f"severity: {severity}",
         f"reason: {reason}",
         f"source: {source}",
-        "---",
-        "",
     ]
+    # 取代关系写进 frontmatter（真相源）—— 删掉 memory.db 之后关系必须还在。
+    if supersedes:
+        fm.append(f"supersedes: {supersedes}")
+    if invalid_at:
+        fm.append(f"invalid_at: {invalid_at}")
+    if superseded_by:
+        fm.append(f"superseded_by: {superseded_by}")
+    fm += ["---", ""]
     return "\n".join(fm) + body.strip() + "\n"
+
+
+def update_frontmatter(path: Path, updates: dict) -> bool:
+    """就地改写一个已存在卡片的 frontmatter 字段（原子写）。返回是否真的改了。
+
+    **只替换给定的键，其余行原样保留。** 这一点是刻意的：卡片可能是人手工写的、
+    可能有本项目不知道的字段（别的工具加的、旧的实验字段），重新渲染整份 frontmatter
+    会把它们抹掉 —— 而「抹掉别人写的东西」是不可逆的损失，且不会报错。
+
+    做法是逐行替换 ``key: ...``，缺失的键追加在结束分隔符之前。正文与
+    ``<!-- contentHash: ...>`` 注释一并原样保留：前者是卡片内容，后者是幂等比对用的标记，
+    动了它下次重复写入就会多出一张卡。
+
+    找不到 frontmatter（文件不以 ``---`` 开头）时返回 False 且**不写盘** ——
+    宁可让调用方看到「没改成功」，也不要往一个格式不明的文件里硬塞字段。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # 剥掉可能存在的 BOM 再判断，否则第一行是 "\ufeff---" 而匹配不上
+    stripped = text.lstrip("\ufeff")
+    lines = stripped.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return False
+
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return False
+
+    remaining = dict(updates)
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if i == end:
+            # 结束分隔符之前，把没找到的键补上（保持原有键的相对顺序）
+            for key, value in remaining.items():
+                out.append(f"{key}: {value}")
+            remaining.clear()
+            out.append(line)
+            continue
+        if 0 < i < end and ":" in line:
+            key = line.split(":", 1)[0].strip()
+            if key in remaining:
+                out.append(f"{key}: {remaining.pop(key)}")
+                continue
+        out.append(line)
+
+    new_text = "\n".join(out)
+    if not stripped.startswith("---"):  # pragma: no cover - 上面已 return
+        new_text = stripped
+    if new_text == stripped:
+        return False  # 没有任何变化，不必写盘（也避免无谓地改动 mtime）
+
+    tmp = path.with_suffix(".md.tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def supersede_card(
+    vault: str | Path,
+    old_rel_path: str,
+    *,
+    title: str,
+    body: str,
+    kind: str = DEFAULT_KIND,
+    tags: list[str] | None = None,
+    source: str = "agent",
+) -> dict:
+    """写一张新卡，并让旧卡失效（取代语义）。
+
+    ``old_rel_path`` 是旧卡相对 vault 的路径（``03-Knowledge/xxx.md``）——
+    **用路径而不是 id**：id 是 rowid，``index --rebuild`` 后会重排，关系会错位。
+    而且这个函数是纯文件操作，它根本不想依赖索引是否存在。
+
+    三步，顺序不可换：
+
+    1. **先写新卡**（带 ``supersedes`` 指向旧卡）。若这步失败，什么都没变；
+    2. **再给旧卡打失效标记**（``invalid_at`` + ``superseded_by``）。
+       若这步失败，结果是「两张都有效」—— 比反过来的「两张都失效、新卡还不存在」好得多，
+       因为前者只是查询时多给一条，后者是用户刚写的内容凭空消失；
+    3. 由调用方索引两张卡（本函数不做索引 —— 它不该知道索引的存在）。
+
+    **旧卡文件永远保留，只加标记。** 这是取代与删除的根本区别，也是「事后能回答
+    『当时是多少』」的唯一依据。
+
+    返回 ``{"ok", "new_path", "old_path", "invalid_at", "reason"}``。
+    """
+    vault = Path(vault)
+    old_path = (vault / old_rel_path).resolve()
+    # 防越界：rel_path 来自调用方，不允许指到 vault 之外
+    try:
+        old_rel = old_path.relative_to(vault.resolve()).as_posix()
+    except ValueError:
+        return {"ok": False, "reason": f"路径不在 vault 内：{old_rel_path}"}
+
+    if not old_path.is_file():
+        return {"ok": False, "reason": f"要取代的卡片不存在：{old_rel}"}
+
+    old_text = old_path.read_text(encoding="utf-8")
+    if "invalid_at:" in old_text:
+        # 已经被取代过 —— 不允许链式覆盖。
+        # 否则「A 被 B 取代、B 又被 C 取代」时，A 的 superseded_by 会指向谁就开始
+        # 取决于操作顺序，而历史链会静默断掉。让调用方显式处理这种情况。
+        return {"ok": False,
+                "reason": f"这张卡已被取代过（{old_rel}），请改取代当前有效的那张"}
+
+    # 1) 写新卡
+    new = write_card(
+        vault, title=title, body=body, kind=kind, tags=tags, source=source,
+        reason="取代旧卡", supersedes=old_rel,
+    )
+    if not new.get("ok"):
+        return {"ok": False, "reason": f"新卡未写入：{new.get('reason')}"}
+
+    new_rel = Path(new["path"]).resolve().relative_to(vault.resolve()).as_posix()
+    invalid_at = _now_iso()
+
+    # 2) 给旧卡打标记（只改这两个键，其余行与正文原样保留）
+    changed = update_frontmatter(old_path, {
+        "invalid_at": invalid_at,
+        "superseded_by": new_rel,
+    })
+    if not changed:
+        # 新卡已经写进去了，但旧卡没标上 —— 结果是「两张都有效」。
+        # 不回滚新卡：真相源优先，用户刚写的内容不该因为收尾失败就消失。
+        # 但必须如实报出来，并给出可执行的修法。
+        return {
+            "ok": False,
+            "new_path": str(Path(new["path"])),
+            "old_path": str(old_path),
+            "reason": (f"新卡已写入，但旧卡（{old_rel}）的 frontmatter 未能改写 —— "
+                       f"可能是文件缺少 frontmatter 段。两张卡现在都有效，"
+                       f"请手工在旧卡里加 invalid_at 与 superseded_by，或删掉新卡重来。"),
+        }
+
+    return {
+        "ok": True,
+        "new_path": str(Path(new["path"])),
+        "old_path": str(old_path),
+        "new_rel": new_rel,
+        "old_rel": old_rel,
+        "invalid_at": invalid_at,
+        "reason": f"已用新卡取代 {old_rel}",
+    }
 
 
 def _unique_path(directory: Path, slug: str) -> Path:
@@ -292,6 +466,7 @@ def write_card(
     reason: str = "agent 主动沉淀",
     on_conflict: str = "suffix",
     reject_secrets: bool = False,
+    supersedes: str = "",
 ) -> dict:
     """写入一张卡片。
 
@@ -386,7 +561,7 @@ def write_card(
     path = _unique_path(directory, slug)
 
     text = _render(title, body, kind, tags or [], source, status, severity,
-                   reason, _now_iso())
+                   reason, _now_iso(), supersedes=supersedes)
     # 指纹写进注释，供下次幂等比对（标记名保持 contentHash 不变）
     text = text.rstrip("\n") + f"\n\n<!-- contentHash: {fingerprint} -->\n"
 

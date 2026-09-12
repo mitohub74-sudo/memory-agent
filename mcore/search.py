@@ -94,6 +94,11 @@ class Hit:
     # 语义：``all`` / ``all-prefix`` 档按定义恒为 1.0（全部词都命中了）；
     # 只有 ``any`` / ``any-prefix`` 档才可能小于 1。
     coverage: float = 1.0
+    # 失效时刻（ISO 字符串，空 = 仍有效）。
+    # 只在调用方显式要「连失效的卡一起看」时才有内容 —— 默认检索里恒为空。
+    # 它**只用于展示**（让人看出「这张已经过期了」），不参与排序也不影响可见性判定
+    # （可见性由 SQL 里的 invalid_at 过滤决定，不靠这个字段）。
+    invalid_at: str = ""
     # 仅供覆盖率高精度计算使用的正文，**不对外暴露**（repr=False）。
     # 为什么不复用 snippet：snippet 是给模型看的一小段，覆盖率必须在全文上算，
     # 否则同一张卡会因为片段截断而得到不同的置信度。
@@ -248,9 +253,11 @@ class KeywordSearcher:
         self.conn = conn
         self.fallback_any = fallback_any
 
-    def _run(self, expr: str, limit: int, kind: str | None, source: str | None):
+    def _run(self, expr: str, limit: int, kind: str | None, source: str | None,
+             *, as_of: str = "", include_invalid: bool = False):
         sql = [
             "SELECT c.id, c.rel_path, c.title, c.kind, c.source, c.body,",
+            "       c.invalid_at,",  # 供调用方显式查失效卡时标注用
             "       bm25(cards_fts) AS score",
             "  FROM cards_fts",
             "  JOIN cards c ON c.id = cards_fts.rowid",
@@ -263,6 +270,29 @@ class KeywordSearcher:
         if source:
             sql.append("   AND c.source = ?")
             params.append(source)
+        # 有效性命中：默认只给「当前有效」的卡（A1 的决定）。
+        #
+        # **它是可见性过滤，不是排序信号。** 这一点必须写在代码里：本项目花过学费
+        # 证明「拿额外信号去重排结果」是负优化（OR 档按命中词数重排，目标卡从第 4
+        # 名掉到第 9 名）。这里只决定「哪些行参与」，绝不参与「谁排前面」——
+        # ORDER BY 仍然只有 bm25 一个来源。
+        if not include_invalid:
+            if as_of:
+                # 「在 as_of 那一天，它是有效的」：
+                #   那天已经存在（created <= as_of），且那天还没失效（invalid_at 为空或晚于 as_of）
+                # created 为空的卡按「一直有效」处理 —— 解析失败不该让一张卡凭空消失。
+                sql.append("   AND (c.created = '' OR substr(c.created, 1, 10) <= ?)")
+                params.append(as_of)
+                sql.append("   AND (c.invalid_at = '' OR substr(c.invalid_at, 1, 10) > ?)")
+                params.append(as_of)
+            else:
+                sql.append("   AND c.invalid_at = ''")
+        elif as_of:
+            # 显式要「连失效的一起看」并且指定了日期时，日期仍然生效：
+            # 否则 --include-invalid --as-of 的组合会变成「完全无视日期」，
+            # 而调用方的意图显然是「在那个时点，包括当时已失效的」。
+            sql.append("   AND (c.created = '' OR substr(c.created, 1, 10) <= ?)")
+            params.append(as_of)
         # bm25() 返回负值，越小越相关 —— 升序即最佳优先。
         # **这一行是排序的唯一来源。** 任何展示用字段（如 coverage）都不得插进来：
         # OR 档按命中词数重排已被 bench 实测证伪为负优化，别再试。
@@ -283,6 +313,7 @@ class KeywordSearcher:
             snippet=make_snippet(body, query),
             matched=mode,
             coverage=compute_coverage(body, row["title"], query, matched=mode),
+            invalid_at=str(row["invalid_at"] or ""),
             _body=body,
         )
 
@@ -293,7 +324,17 @@ class KeywordSearcher:
         *,
         kind: str | None = None,
         source: str | None = None,
+        as_of: str = "",
+        include_invalid: bool = False,
     ) -> list[Hit]:
+        """检索。
+
+        ``as_of``（``YYYY-MM-DD``，可只给前缀粒度）：回溯到那一天**当时有效**的卡。
+        ``include_invalid``：连已失效的卡一起返回（默认不返回 —— A1 的决定）。
+
+        两个参数都只影响**可见性**，不影响排序：具体的过滤在 ``_run`` 里，
+        排序永远只有 bm25 一个来源。
+        """
         terms = query_terms(query)
         if not terms:
             return []
@@ -303,7 +344,8 @@ class KeywordSearcher:
             expr = to_query_expr(query, joiner, prefix=prefix)
             if not expr:
                 continue
-            rows = self._run(expr, limit, kind, source)
+            rows = self._run(expr, limit, kind, source,
+                             as_of=as_of, include_invalid=include_invalid)
             if rows:
                 return [self._to_hit(r, query, mode) for r in rows]
         return []

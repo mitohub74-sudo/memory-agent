@@ -186,6 +186,12 @@ def build_card(vault: Path, path: Path) -> dict:
         "priority": _parse_priority(meta.get("priority", 0)),
         "ttl": ttl_raw,
         "expires_at": _parse_ttl(ttl_raw),
+        # 取代关系同样来自 frontmatter —— 它必须能在「删掉 memory.db 之后」依然存在。
+        # 关系是**不可从别处推导**的信息：索引没了就真没了，所以真相源只能是 Markdown。
+        # 正反两向都读：invalid_at 供 --as-of 判定，superseded_by/supersedes 供人查看链路。
+        "invalid_at": str(meta.get("invalid_at", "") or ""),
+        "superseded_by": str(meta.get("superseded_by", "") or ""),
+        "supersedes": str(meta.get("supersedes", "") or ""),
         "body": body,
         # file_hash = 整份文件文本（含 frontmatter）的哈希，用于增量比对。
         # 与 capture 的 card_fingerprint（标题+正文）是两个不同的东西，

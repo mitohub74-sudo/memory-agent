@@ -166,7 +166,33 @@ python memory.py capture --title "标题" --body "正文" [--kind knowledge] [--
 | 正文 < 20 字符 | 拒绝，返回 `rejected` |
 | **标题相同、正文不同** | **不覆盖**已有卡；默认另存为 `-2`，并回传 `conflict: true` + `existing_path` + `collision_paths` |
 | `--on-conflict reject` 下的标题撞车 | 不写盘，返回 `conflict`，退出码 **3** |
+| 正文/标题含疑似凭据 | **仍然写入**，但回传 `secrets_found` + `warnings`（默认只告警） |
+| `--reject-secrets` 下含疑似凭据 | 不写盘，返回 `rejected`，退出码 **1** |
 | 索引失败 | 卡片仍在磁盘（真相源优先），返回 `indexed: false` + `warning` |
+
+### 敏感内容：默认只告警，不阻断
+
+正文与标题都会扫一遍常见凭据形态：私钥头（`-----BEGIN ... PRIVATE KEY-----`）、
+AWS Access Key ID、GitHub / Slack token、Google API Key、OpenAI 风格 key、JWT、
+以及 `password = xxx` 这类明文赋值。
+
+**命中后默认照常写入**，只在结果里回传 `secrets_found` 与 `warnings`。
+需要更严时加 `--reject-secrets`（MCP 的 `memory_capture` 传 `reject_secrets: true`）。
+
+**为什么默认不拦**：本库的正当用途就包含渗透测试记录，而这类记录里天然会出现密钥、
+连接串、凭据 —— 硬拒会把项目本身的用途一起拒掉。这是刻意的取舍，不是漏做。
+
+两条实现上的约束，都是有意为之：
+
+1. **告警不复述凭据**。只报「命中了哪一类 + 位置区间」，不回显原文 ——
+   把密钥抄进告警里等于又写了一遍到返回值与日志里，反而扩大暴露面。
+2. **宁可漏报，不要误报**。`~/.ssh/id_ed25519`、`密钥见 ~/.ssh/xxx`、
+   `token: 见上一条记录` 这类引用式写法**不会**被标记；赋值式还要求值同时含字母与数字
+   （`password: 已改成用密钥登录` 是说明文字，不是凭据）。误报多起来，告警会被所有人忽略，
+   那比没有告警更坏。
+
+> 这是**提醒**，不是安全边界。真要严格管控凭据请用专门的扫描工具，不要让「顺手的正则」
+> 承担安全职责。
 
 **为什么标题撞车要显式回传**：同标题不同正文过去会**静默**多出一个 `slug-2.md` ——
 调用方只看到「写好了」，不知道库里已经有两张同标题的卡，此后检索会同时命中两张，

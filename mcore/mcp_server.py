@@ -154,6 +154,14 @@ TOOLS: list[dict[str, Any]] = [
                         "若你要表达「事实变了」，不要靠这个参数 —— 用取代语义。"
                     ),
                 },
+                "reject_secrets": {
+                    "type": "boolean",
+                    "description": (
+                        "true 时若正文含疑似凭据（私钥头、AWS/GitHub/Slack token、"
+                        "明文密码赋值等）则拒绝写入；默认 false = 只告警不阻断。"
+                        "默认不阻断是因为本库的正当用途包含渗透测试记录。"
+                    ),
+                },
             },
             "required": ["title", "body"],
         },
@@ -344,6 +352,7 @@ class MemoryServer:
             tags=[str(t) for t in tags],
             source=str(args.get("source") or self.client_name),
             on_conflict=str(args.get("on_conflict") or "suffix"),
+            reject_secrets=bool(args.get("reject_secrets")),
         )
 
         if not result["ok"]:
@@ -386,6 +395,14 @@ class MemoryServer:
             payload["suggestion"] = (
                 "同标题但内容不同的卡片已存在。若这是对既有事实的修正，"
                 "请改用更新；若事实已变而旧值仍需留存，请改用取代。"
+            )
+        # 敏感内容：卡片已写入，但把风险明确回传给调用方 —— 它才是能改正文的人。
+        if result.get("secrets_found"):
+            payload["secrets_found"] = result["secrets_found"]
+            payload["warnings"] = result.get("warnings", [])
+            payload["suggestion_secrets"] = (
+                "这条内容里出现了疑似凭据。记忆库会被长期保留、并会被检索召回，"
+                "建议改成引用方式（如「密钥见 ~/.ssh/xxx」）后重新写入。"
             )
         if warning:
             payload["warning"] = warning

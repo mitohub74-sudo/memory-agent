@@ -420,6 +420,34 @@ def main() -> int:
             check("reject 策略下写入被拒绝",
                   r.get("result", {}).get("isError") is True, str(r)[:160])
 
+            # 敏感内容：默认**只告警不阻断**（含私钥头也要写入）。
+            # 这是 ROADMAP 明定的取舍：本库的正当用途包含渗透测试记录。
+            pem = "-" * 5 + "BEGIN RSA PRIVATE KEY" + "-" * 5
+            secret_body = f"示例机器登录方式：\n{pem}\nMIIEowIBAAKCAQEA（示例内容）\n"
+            r = c2.request("tools/call", {"name": "memory_capture",
+                                          "arguments": {"title": "含私钥头的记录",
+                                                        "body": secret_body}})
+            t = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            try:
+                out = json.loads(t)
+                check("含私钥头默认仍写入（不阻断）",
+                      out.get("action") == "created", str(out)[:160])
+                check("含私钥头回传 secrets_found",
+                      bool(out.get("secrets_found")), str(out)[:200])
+                check("含私钥头回传 warnings", bool(out.get("warnings")), str(out)[:200])
+                check("告警不复述凭据原文",
+                      pem not in json.dumps(out, ensure_ascii=False), str(out)[:200])
+            except json.JSONDecodeError:
+                check("含私钥头写入返回合法 JSON", False, t[:150])
+
+            # 开 reject_secrets 才拒绝
+            r = c2.request("tools/call", {"name": "memory_capture",
+                                          "arguments": {"title": "含私钥头的记录二",
+                                                        "body": secret_body,
+                                                        "reject_secrets": True}})
+            check("reject_secrets=true 时拒绝写入",
+                  r.get("result", {}).get("isError") is True, str(r)[:160])
+
             # 关键：**不调 memory_reindex**，写入后直接检索。
             # 若 capture 没有真正建索引，这里就会搜不到 —— 这正是要防的「假成功」。
             r = c2.request("tools/call", {"name": "memory_search",
@@ -434,7 +462,8 @@ def main() -> int:
             files = list((Path(tmp) / "vault").rglob("*.md"))
             login = [f for f in files if "登录" in f.name]
             check("隔离 vault 里没有测试之外的文件",
-                  all(any(k in f.name for k in ("登录", "撞车", "长卡分片")) for f in files),
+                  all(any(k in f.name for k in ("登录", "撞车", "长卡分片", "含私钥头"))
+                      for f in files),
                   str([f.name for f in files]))
             check("中文标题保留在文件名中", len(login) == 1,
                   str([f.name for f in files]))

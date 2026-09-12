@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """memory-agent CLI —— 面向大模型的本地记忆检索。
 
@@ -279,6 +279,7 @@ def cmd_capture(args) -> int:
         tags=tags,
         source=args.source,
         on_conflict=args.on_conflict,
+        reject_secrets=args.reject_secrets,
     )
 
     if not result["ok"]:
@@ -313,6 +314,12 @@ def cmd_capture(args) -> int:
     def render(d):
         mark = "已索引" if d.get("indexed") else "未索引"
         print(f"{d['action']}  {d.get('path', '')}  [{mark}]")
+        # 敏感内容告警走 stderr：stdout 是给人/机器读的结果，告警属于旁路提示。
+        # 注意告警**不改变退出码** —— 默认不阻断（见 capture.SECRET_PATTERNS 的说明）。
+        for w in d.get("warnings", []) or []:
+            print(f"警告：{w}", file=sys.stderr)
+        if d.get("note"):
+            print(d["note"], file=sys.stderr)
         if d.get("warning"):
             print(d["warning"], file=sys.stderr)
 
@@ -422,6 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
                     default="suffix",
                     help="标题撞车（同标题不同正文）时的处理："
                          "suffix=另存为 -2 新卡并回传冲突信息（默认）；reject=拒绝写入")
+    pc.add_argument("--reject-secrets", action="store_true",
+                    help="正文含疑似凭据时拒绝写入（默认**只告警**，见 README）")
     pc.add_argument("--vault", help="vault 目录")
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_capture)

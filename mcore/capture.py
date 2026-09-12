@@ -22,8 +22,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-__all__ = ["KIND_DIRS", "DEFAULT_KIND", "CONFLICT_POLICIES", "write_card", "scan_slug",
-           "card_fingerprint", "slugify"]
+__all__ = ["KIND_DIRS", "DEFAULT_KIND", "CONFLICT_POLICIES", "SECRET_PATTERNS",
+           "write_card", "scan_secrets", "scan_slug", "card_fingerprint", "slugify"]
 
 # kind -> 分类目录（与既有 vault 结构一致）
 KIND_DIRS: dict[str, str] = {
@@ -47,6 +47,71 @@ MAX_SLUG_CHARS = 60
 # 标题撞车（slug 相同）但内容不同时的处理策略。
 # 默认 suffix：保持既有行为不变 —— 不覆盖任何已有卡片。
 CONFLICT_POLICIES = ("suffix", "reject")
+
+# ---------------------------------------------------------------- 敏感内容扫描
+#
+# **这是在提醒，不是在拦截。** 默认只把命中结果回传给调用方，绝不阻断写入。
+#
+# 为什么默认不硬拒：本库的用途之一就是存渗透测试记录，而这类记录里天然会出现
+# 密钥、凭据、连接串 —— 硬拒等于把项目的正当用途一起拒掉（ROADMAP §9 第 10 条）。
+# 需要更严的场合由调用方显式开 ``--reject-secrets``。
+#
+# 每条只报「命中了哪一类」，**不回显命中的原文**：把密钥抄进告警里，
+# 等于把它又写了一遍到日志 / 返回值里，反而扩大了暴露面。
+SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("私钥头", re.compile(r"-{5}BEGIN [A-Z ]*PRIVATE KEY-{5}")),
+    ("SSH 私钥文件体", re.compile(r"-{5}BEGIN OPENSSH PRIVATE KEY-{5}")),
+    ("AWS Access Key ID", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("GitHub Token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("Slack Token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Google API Key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("OpenAI 风格 Key", re.compile(r"\bsk-[A-Za-z0-9]{16,}\b")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")),
+    # 赋值式凭据：键名**紧跟**冒号或等号，且值要同时含字母与数字。
+    #
+    # 两条约束都是实测加上的：
+    #
+    # 1. 「紧跟」——早期写成 `\bprivate[_-]?key\b\s*[:=]`，``\b`` 允许把键名截短成
+    #    `private`，于是散文「private key 指的是概念」被判成凭据；
+    # 2. 「值含字母**且**含数字」——``password: 已改成用密钥登录`` 这种说明性文字
+    #    长度足够、看着也像赋值，但它没有数字。真实凭据（``hunter2hunter2``、
+    #    ``aBcD1234``）几乎都混合字母与数字。
+    #
+    # 误报一旦多起来，告警会被所有人忽略 —— 那比没有告警更坏，所以宁可漏一点。
+    # 这条局限写在这里，不要靠加长正则去追：真正要严的场合应该开 ``reject_secrets``
+    # 或改用专门的凭据扫描工具，而不是让「顺手的正则」承担安全职责。
+    ("疑似明文凭据赋值",
+     re.compile(r"(?i)\b(?:password|passwd|pwd|api[_-]?key|apikey|secret|"
+                r"access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret)"
+                r"(?![A-Za-z])[`\"']?\s*[:=]\s*[\"']?"
+                r"(?=[^\s\"'`,]{8,})(?=[^\s\"'`,]*[A-Za-z])(?=[^\s\"'`,]*\d)"
+                r"([^\s\"'`,]+)")),
+)
+
+
+def scan_secrets(text: str) -> list[dict]:
+    """扫出疑似凭据，返回 ``[{"kind", "span"}...]``（**不含命中原文**）。
+
+    ``span`` 是命中位置区间，用于让人自己回到原文确认 —— 我们只指出「这里有东西」，
+    不替调用方把凭据复述一遍。
+    """
+    text = text or ""
+    found: list[dict] = []
+    for kind, pattern in SECRET_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            found.append({"kind": kind, "span": [match.start(), match.end()]})
+    return found
+
+
+def _secret_warnings(findings: list[dict]) -> list[str]:
+    """把命中结果转成给人看的告警文案（刻意不含凭据内容）。"""
+    return [
+        f"检测到疑似凭据（{f['kind']}，位置 {f['span'][0]}-{f['span'][1]}）。"
+        f"记忆库会长期保留这条内容，且会被检索召回 —— 若非必要请改成引用方式"
+        f"（例如「密钥见 ~/.ssh/xxx」而不是贴上密钥本身）。"
+        for f in findings
+    ]
 
 # 文件名安全化：保留中文、字母数字、连字符；其余折叠为连字符
 _UNSAFE = re.compile(r"[^\w\u4e00-\u9fff-]+", re.UNICODE)
@@ -178,6 +243,7 @@ def write_card(
     severity: str = "info",
     reason: str = "agent 主动沉淀",
     on_conflict: str = "suffix",
+    reject_secrets: bool = False,
 ) -> dict:
     """写入一张卡片。
 
@@ -195,6 +261,10 @@ def write_card(
     ``existing_path`` 的语义统一为「**slug 基名对应的那张卡**」（``slug.md``），
     无论它是新写出的还是早就存在的 —— 调用方要的是「我在跟谁撞车」，而基名是
     唯一确定的答案。被撞的实际文件清单在 ``collision_paths`` 里。
+
+    **敏感内容默认只告警**：命中 ``SECRET_PATTERNS`` 时结果里带
+    ``secrets_found`` 与 ``warnings``，但**照常写入**。``reject_secrets=True``
+    才改成拒绝。为什么默认不拦见 ``SECRET_PATTERNS`` 上方的说明。
     """
     vault = Path(vault)
     title = (title or "").strip()
@@ -212,6 +282,19 @@ def write_card(
                 "reason": f"未知的 on_conflict 策略：{on_conflict!r}，"
                           f"可选 {' / '.join(CONFLICT_POLICIES)}"}
 
+    # 敏感内容扫描在写盘之前做，但**默认不因此拒绝** —— 只把结果带回去。
+    # 标题也扫：有些人会把密钥塞在标题里。
+    findings = scan_secrets(f"{title}\n{body}")
+    if findings and reject_secrets:
+        return {
+            "ok": False,
+            "action": "rejected",
+            "secrets_found": [f["kind"] for f in findings],
+            "reason": (f"正文含疑似凭据（{'、'.join(f['kind'] for f in findings)}），"
+                       f"且已开启 reject_secrets，故拒绝写入。"
+                       f"请改为引用方式（如「密钥见 ~/.ssh/xxx」）。"),
+        }
+
     kind = (kind or DEFAULT_KIND).strip().lower()
     if kind not in KIND_DIRS:
         kind = DEFAULT_KIND
@@ -225,14 +308,18 @@ def write_card(
     # 改了它，磁盘上既有卡片的标记就再也匹配不上。
     scan = scan_slug(directory, slug, title, fingerprint)
     if scan["same"] is not None:
-        return {"ok": True, "action": "unchanged",
-                "path": str(scan["same"]), "reason": "内容相同，已存在"}
+        result = {"ok": True, "action": "unchanged",
+                  "path": str(scan["same"]), "reason": "内容相同，已存在"}
+        if findings:
+            result["secrets_found"] = [f["kind"] for f in findings]
+            result["warnings"] = _secret_warnings(findings)
+        return result
 
     collisions: list[Path] = scan["collisions"]
     base_path = directory / f"{slug}.md"
 
     if collisions and policy == "reject":
-        return {
+        result = {
             "ok": False,
             "action": "conflict",
             "path": "",
@@ -242,6 +329,10 @@ def write_card(
                        f"共 {len(collisions)} 张同标题卡）。"
                        f"若想改动既有事实用 update；若事实已变、旧卡仍需留存用 supersede。"),
         }
+        if findings:
+            result["secrets_found"] = [f["kind"] for f in findings]
+            result["warnings"] = _secret_warnings(findings)
+        return result
 
     directory.mkdir(parents=True, exist_ok=True)
     path = _unique_path(directory, slug)
@@ -272,4 +363,9 @@ def write_card(
         result["collision_paths"] = [str(p) for p in collisions]
         result["note"] = (f"标题与已有 {len(collisions)} 张卡相同但内容不同，"
                           f"已另存为 {path.name}（未覆盖任何卡片）。")
+    if findings:
+        # 告警与「已写入」并存：卡片确实写进去了，同时把风险说出来。
+        # 不合并进 note，是因为 note 已被撞车占用；两个字段各自独立更清楚。
+        result["secrets_found"] = [f["kind"] for f in findings]
+        result["warnings"] = _secret_warnings(findings)
     return result

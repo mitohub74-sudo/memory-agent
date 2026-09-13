@@ -558,17 +558,25 @@ def upsert_card(conn: sqlite3.Connection, card: dict) -> str:
     return "inserted"
 
 
-def delete_cards(conn: sqlite3.Connection, rel_paths: list[str]) -> int:
+def delete_cards(conn: sqlite3.Connection, rel_paths: list[str],
+                 *, keep_stats: bool = False) -> int:
     """按路径批量删除卡片及其索引行。返回删除数量。
 
     **批量化**：原来是一张卡三条语句（SELECT id、删 FTS、删 cards），删除 N 张
     就是 3N 次往返。SQLite 的参数上限是 **999**（编译期 ``SQLITE_MAX_VARIABLE_NUMBER``，
     老版本更低），所以按块切分而不是一次性拼一整个 IN 列表 —— 超限会直接报错。
 
-    **同时清 card_stats**：卡片真的离开 vault 之后，它的读取次数已经没有任何意义，
-    留着就是「永远读不出来的幽灵行」（join cards 时消失，但确实占着表）。
-    注意软删（P3-02 的 `.trash`）是**可恢复**的，那条路径不该走这个函数 ——
-    统计要留到真正销毁（``delete --purge``）时才丢。
+    ``card_stats`` 清不清，取决于**这次删除可不可逆**（``keep_stats``）：
+
+    - ``False``（默认，硬删路径）：连 ``card_stats`` 一起清。卡片真的离开 vault 之后，
+      它的读取次数已经没有任何意义，留着就是「永远读不出来的幽灵行」
+      （join cards 时消失，但确实占着表）。
+    - ``True``（软删路径，P3-02 的 ``.trash``）：**保留统计**。软删是可恢复的，
+      恢复之后「这张卡被读过几次」应当照旧 —— 全项目**唯一不可重建的就是 card_stats**，
+      清了它就是清掉一份没有第二个来源的数据。
+
+    两个调用方都必须显式选一条。默认取硬删，是因为「删掉了就该清」是更常见的意图，
+    而软删那一侧有明确的函数名（``capture.delete_card``）挡在前面。
     """
     rels = [r for r in dict.fromkeys(rel_paths) if r]  # 去重且保序
     if not rels:
@@ -590,10 +598,58 @@ def delete_cards(conn: sqlite3.Connection, rel_paths: list[str]) -> int:
         id_ph = ",".join("?" * len(ids))
         conn.execute(f"DELETE FROM cards_fts WHERE rowid IN ({id_ph})", ids)
         conn.execute(f"DELETE FROM cards WHERE id IN ({id_ph})", ids)
+        if not keep_stats:
+            conn.execute(
+                f"DELETE FROM card_stats WHERE rel_path IN ({placeholders})", chunk
+            )
+        n += len(ids)
+    return n
+
+    # 留出余量：每个 chunk 用 1 个参数查 id + 1 个参数查 stats。
+    chunk_size = (SQLITE_MAX_VARIABLES - 1) // 2
+    n = 0
+    for start in range(0, len(rels), chunk_size):
+        chunk = rels[start : start + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        ids = [
+            int(r["id"]) for r in conn.execute(
+                f"SELECT id FROM cards WHERE rel_path IN ({placeholders})", chunk
+            )
+        ]
+        if not ids:
+            continue
+        id_ph = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM cards_fts WHERE rowid IN ({id_ph})", ids)
+        conn.execute(f"DELETE FROM cards WHERE id IN ({id_ph})", ids)
         conn.execute(
             f"DELETE FROM card_stats WHERE rel_path IN ({placeholders})", chunk
         )
         n += len(ids)
+    return n
+
+
+def drop_stats(conn: sqlite3.Connection, rel_paths: list[str]) -> int:
+    """清掉若干路径的读取统计（``card_stats``）。返回清掉的行数。
+
+    **为什么单独一个函数**：``delete_cards`` 在「索引里已经没有这一行」时会直接跳过，
+    于是它的 ``card_stats`` 删除语句也就不会执行。而软删（``.trash``）恰恰就是
+    先把卡从 ``cards`` 里摘掉、**统计留着**（可恢复），等到 ``--purge`` 才该丢统计 ——
+    那时 ``cards`` 里早就没有这一行了，``delete_cards`` 帮不上忙，
+    统计会变成永远读不出来的幽灵行（``stats`` 用 LEFT JOIN，看不见它）。
+
+    所以「真删」的收尾是两步：``delete_cards``（清索引）+ ``drop_stats``（清统计）。
+    """
+    rels = [r for r in dict.fromkeys(rel_paths) if r]
+    if not rels:
+        return 0
+    n = 0
+    for start in range(0, len(rels), SQLITE_MAX_VARIABLES - 1):
+        chunk = rels[start : start + SQLITE_MAX_VARIABLES - 1]
+        placeholders = ",".join("?" * len(chunk))
+        cur = conn.execute(
+            f"DELETE FROM card_stats WHERE rel_path IN ({placeholders})", chunk
+        )
+        n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return n
 
 

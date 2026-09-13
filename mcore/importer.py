@@ -11,7 +11,6 @@ frontmatter 解析刻意不引入 PyYAML —— 只支持本项目实际用到�
 from __future__ import annotations
 
 import hashlib
-import re
 import sqlite3
 import time
 from datetime import datetime
@@ -19,7 +18,7 @@ from pathlib import Path
 
 from .store import delete_cards, retry_on_locked, upsert_card
 from .store import commit as store_commit
-from .util import parse_tags
+from .util import parse_duration, parse_tags
 
 __all__ = ["parse_frontmatter", "build_card", "sync", "sync_one"]
 
@@ -139,13 +138,10 @@ def _parse_ttl(raw) -> int:
             continue
 
     # 相对时长：1d12h30m（整串只允许数字与 d/h/m，别的一律不认）
-    compact = re.sub(r"\s+", "", text.lower())
-    parts = re.findall(r"(\d+)([dhm])", compact)
-    if not parts or "".join(f"{n}{u}" for n, u in parts) != compact:
+    # 解析收口在 util.parse_duration —— 回收站清理用的是同一个口径。
+    seconds = parse_duration(text)
+    if seconds is None:
         return 0
-    seconds = 0
-    for value, unit in parts:
-        seconds += int(value) * {"d": 86400, "h": 3600, "m": 60}[unit]
     return int(time.time()) + seconds if seconds else 0
 
 

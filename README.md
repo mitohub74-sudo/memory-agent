@@ -105,6 +105,7 @@ python memory.py index [--rebuild]    # 同步 / 重建索引
 python memory.py search <query>       # 检索
 python memory.py capture --title T --body B   # 写入一张卡片
 python memory.py update <id> --body B         # 原地改一张卡（见「更新」一节）
+python memory.py delete <id>                  # 软删到 .trash（见「删除」一节）
 python memory.py stats                # 统计
 python memory.py show <id>            # 卡片全文（长卡默认分片，见下）
 python memory.py mcp                  # 启动 MCP server
@@ -202,6 +203,38 @@ python memory.py update 12 --priority 5 --ttl 30d
   「什么都没改」错读成「索引坏了」；
 - **不从 stdin 读正文**：`--body` 不给就是「不动正文」。否则「没打算改正文」
   会变成「把管道内容当成新正文写进去」。
+
+### 删除：默认软删到回收站
+
+```bash
+python memory.py delete 12                          # 软删到 .trash/<原相对路径>（可恢复）
+python memory.py delete --restore 03-Knowledge/x.md # 移回原位
+python memory.py delete --purge 03-Knowledge/x.md   # 彻底删除（不可恢复）
+python memory.py delete --purge --older-than 30d    # 只清「删除超过 30 天」的
+python memory.py delete --purge --all               # 清空回收站
+```
+
+**默认软删**：文件移到 `<vault>/.trash/<原相对路径>`（原目录结构保留，所以恢复不需要
+任何额外记录），索引里摘掉这一行，于是检索立刻搜不到。`index` / `index --rebuild`
+都不会把它捞回来（`.trash` 被排除出扫描）—— 否则卡片会换个路径**复活**，
+而 `delete` 返回的却是「成功」。
+
+三条不可越过的边界：
+
+| 边界 | 为什么 |
+|---|---|
+| 软删**不清** `card_stats`，`--purge` **才**清 | 软删可恢复，而读取统计是**全项目唯一不可重建**的数据；真删之后它才变成读不出来的幽灵行 |
+| `--purge` **只对回收站里的内容生效** | 传一张活着的卡会被拒绝。这不是靠调用方自觉，而是它唯一能删的位置就是 `.trash` |
+| 批量彻底删除**必须给条件**（`--older-than` 或 `--all`） | 没有条件等于「清空回收站」，那种操作不该由一次手滑触发 |
+
+- 回收站**不自动清理**。攒到一定量时 `delete` 会回传 `reminder`、`stats` 会显示
+  回收站张数与占用 —— 提醒归提醒，**动手要人来**；
+- `--older-than` 的判据是**删除时间**，记在 `.trash/.manifest.json` 里。
+  文件的 mtime 在移动后仍是原卡片的写入时间，不能当删除时间用。
+  **清单里没有记录的条目会被跳过并逐条报出**（例如手工放进 `.trash` 的文件）——
+  猜成「很久以前删的」会直接删掉一个来路不明的文件，而那是不可逆的；
+- `--restore` 时目标位置已有卡 → **默认拒绝覆盖**（覆盖是不可逆的丢失）。
+  确认要顶替就加 `--force`：占位的那张会**先被移进回收站**，所以强制恢复也不销毁任何内容。
 
 ### 敏感内容：默认只告警，不阻断
 

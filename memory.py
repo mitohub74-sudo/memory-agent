@@ -43,7 +43,7 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcore import capture, config, importer, mcp_server, readtext, search, store  # noqa: E402
+from mcore import capture, config, importer, mcp_server, readtext, search, store, util  # noqa: E402
 from mcore.util import parse_tags  # noqa: E402
 from mcore.version import __version__  # noqa: E402
 
@@ -199,6 +199,10 @@ def cmd_stats(args) -> int:
     accessed = store.access_stats(conn, limit=5)
     conn.close()
 
+    # 回收站单独报：A3 的决定是「不自动清理，攒到一定量提醒」，所以 stats 是
+    # 用户看到「该清了」的自然位置。这里只数，绝不自动动手。
+    trash = capture.trash_summary(config.vault_path(args.vault))
+
     payload = {
         "ok": True,
         "db": str(db),
@@ -207,6 +211,7 @@ def cmd_stats(args) -> int:
         # 访问统计在独立表里，index --rebuild 不会清它。
         # 口径：被 show/get 取过全文的次数，不含「仅被检索召回」。
         "most_accessed": accessed,
+        "trash": trash,
     }
 
     def render(d):
@@ -219,6 +224,13 @@ def cmd_stats(args) -> int:
             print("读取最多：")
             for item in d["most_accessed"]:
                 print(f"  {item['access_count']:>3}×  {item['rel_path']}")
+        trash = d["trash"]
+        if trash["count"]:
+            print(f"回收站 {trash['count']} 张 · {trash['bytes'] / 1024:.1f} KB"
+                  f"（不自动清理：python memory.py delete --purge --older-than 30d）")
+            if trash["unknown_deleted_at"]:
+                print(f"  其中 {trash['unknown_deleted_at']} 张没有删除时间记录，"
+                      f"--older-than 会跳过它们", file=sys.stderr)
 
     _emit(payload, args.json, render)
     return 0
@@ -439,6 +451,221 @@ def cmd_update(args) -> int:
     return 0
 
 
+def cmd_delete(args) -> int:
+    """删除一张卡（P3-02）。
+
+    三种模式，**默认是软删**：
+
+    - ``delete <id>``：移到 ``<vault>/.trash/<原相对路径>``，可恢复。**保留读取统计**；
+    - ``delete --restore <rel_path>``：把回收站里的卡移回原位；
+    - ``delete --purge [<rel_path> | --older-than 30d | --all]``：**彻底删除**，
+      只对回收站里的内容生效 —— 这条约束是「purge 不可能删掉一张活着的卡」的机制保证。
+    """
+    vault = config.vault_path(args.vault)
+
+    if args.purge is not None:
+        return _delete_purge(args, vault)
+    if args.restore is not None:
+        return _delete_restore(args, vault)
+    return _delete_soft(args, vault)
+
+
+def _delete_soft(args, vault) -> int:
+    db = config.db_path(args.db)
+    if not _require_db(db, args.json):
+        return 2
+
+    if args.id is None:
+        payload = {"ok": False,
+                   "error": "软删需要给出卡片 id。恢复用 --restore <rel_path>，"
+                            "彻底删除用 --purge。"}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 1
+
+    conn = store.connect(db)
+    row = store.get_card(conn, args.id)
+    conn.close()
+    if row is None:
+        payload = {"ok": False, "error": f"找不到 id={args.id}"}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 1
+
+    rel = row["rel_path"]
+    result = capture.delete_card(vault, rel)
+    if not result["ok"]:
+        hint = ""
+        if "不存在" in result["reason"]:
+            # 文件不在磁盘上但索引里还有 —— 索引脏了，指到能修它的命令上。
+            hint = "（文件已不在磁盘上，但索引里还有它 —— 可运行 python memory.py index 清理索引）"
+        payload = {**result, "hint": hint}
+        _emit(payload, args.json,
+              lambda d: print(f"未删除：{d['reason']}{d.get('hint', '')}", file=sys.stderr))
+        return 1
+
+    # 索引：**精确摘掉这一行，但保留 card_stats**（软删可恢复，统计要留到 purge）。
+    # 不走 importer.sync 全量 —— 那是 O(语料)，而这里已经知道要删的是哪一行。
+    indexed, warning = False, ""
+    try:
+        conn = store.connect(db)
+        store.init(conn)
+        store.delete_cards(conn, [rel], keep_stats=True)
+        store.commit(conn)
+        conn.close()
+        indexed = True
+    except Exception as exc:
+        warning = (f"文件已移入回收站（{result['trash_path']}），但索引未更新：{exc}。"
+                   f"可运行 python memory.py index 补建。")
+
+    summary = capture.trash_summary(vault)
+    payload = {"id": args.id, **result, "indexed": indexed,
+               "trash_count": summary["count"],
+               "trash_bytes": summary["bytes"]}
+    if warning:
+        payload["warning"] = warning
+    # A3 的决定：**不自动清理**，攒到一定量提醒用户清理。
+    if summary["count"] >= capture.TRASH_REMIND_THRESHOLD:
+        payload["reminder"] = (
+            f"回收站已积累 {summary['count']} 张卡（{summary['bytes'] / 1024:.1f} KB）。"
+            f"确认不再需要后可清理：python memory.py delete --purge --older-than 30d"
+        )
+
+    def render(d):
+        mark = "已索引" if d["indexed"] else "未索引"
+        print(f"已软删 {d['rel_path']}  ->  {d['trash_path']}  [{mark}]")
+        print(f"  恢复：python memory.py delete --restore {d['rel_path']}")
+        print(f"  回收站现有 {d['trash_count']} 张")
+        for key in ("warning", "reminder"):
+            if d.get(key):
+                print(d[key], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
+
+
+def _delete_restore(args, vault) -> int:
+    result = capture.restore_card(vault, args.restore, force=args.force)
+    if not result["ok"]:
+        _emit(result, args.json,
+              lambda d: print(f"未恢复：{d['reason']}", file=sys.stderr))
+        return 1
+
+    # 只索引这一张卡（不跑全量）。索引不存在时不因此让恢复失败 ——
+    # 移回文件才是这次操作的主体，索引随时可以补建。
+    db = config.db_path(args.db)
+    indexed, warning = False, ""
+    if db.exists():
+        try:
+            conn = store.connect(db)
+            store.init(conn)
+            importer.sync_one(conn, vault, result["path"])
+            store.commit(conn)
+            conn.close()
+            indexed = True
+        except Exception as exc:
+            warning = (f"文件已恢复（{result['rel_path']}），但索引未更新：{exc}。"
+                       f"可运行 python memory.py index 补建。")
+    else:
+        warning = f"索引不存在（{db}），文件已恢复但尚未可检索：先运行 python memory.py index"
+
+    payload = {**result, "indexed": indexed}
+    if warning:
+        payload["warning"] = warning
+
+    def render(d):
+        mark = "已索引" if d["indexed"] else "未索引"
+        print(f"已恢复 {d['rel_path']}  [{mark}]")
+        for key in ("note", "warning"):
+            if d.get(key):
+                print(d[key], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
+
+
+def _delete_purge(args, vault) -> int:
+    if args.older_than and args.all:
+        payload = {"ok": False, "error": "--older-than 与 --all 互斥："
+                                    "前者按删除时间筛选，后者是清空回收站。"}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 1
+
+    if not args.purge:
+        # 批量：必须显式给条件。没有条件等于「清空回收站」，
+        # 那种操作不该由一次手滑触发。
+        older_seconds = None
+        if args.older_than:
+            older_seconds = util.parse_duration(args.older_than)
+            if older_seconds is None:
+                payload = {"ok": False,
+                           "error": f"无法识别的时长：{args.older_than!r}。"
+                                    f"可用 30d / 12h / 45m / 1d12h。"}
+                _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+                return 1
+        if not args.all and older_seconds is None:
+            payload = {"ok": False,
+                       "error": "批量彻底删除必须给条件：--older-than <时长> 或 --all。"
+                                "（只删一张请给路径：delete --purge <rel_path>）"}
+            _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+            return 1
+        result = capture.purge_trash(vault, older_seconds=older_seconds,
+                                     everything=args.all)
+        rels = [e["rel_path"] for e in result.get("purged", [])]
+    else:
+        result = capture.purge_card(vault, args.purge)
+        rels = [result["rel_path"]] if result["ok"] else []
+
+    if not result["ok"]:
+        _emit(result, args.json,
+              lambda d: print(f"未删除：{d['reason']}", file=sys.stderr))
+        return 1
+
+    # 真删才是统计的终点：清索引行 + 清 card_stats。
+    # 软删时 cards 行已经摘掉、统计刻意留着，所以这里必须显式再清一次统计 ——
+    # 只调 delete_cards 会因为它「找不到这一行就跳过」而把统计留成幽灵。
+    stats_dropped, warning = 0, ""
+    db = config.db_path(args.db)
+    if db.exists():
+        try:
+            conn = store.connect(db)
+            store.init(conn)
+            store.delete_cards(conn, rels, keep_stats=False)
+            stats_dropped = store.drop_stats(conn, rels)
+            store.commit(conn)
+            conn.close()
+        except Exception as exc:
+            warning = (f"文件已彻底删除，但索引/统计未更新：{exc}。"
+                       f"可运行 python memory.py index 补建。")
+    else:
+        warning = f"索引不存在（{db}），跳过索引与统计清理。"
+
+    payload = {**result, "stats_dropped": stats_dropped,
+               "trash_count": capture.trash_summary(vault)["count"]}
+    if warning:
+        payload["warning"] = warning
+
+    def render(d):
+        if d.get("purged") is not None:
+            print(f"已彻底删除 {d.get('count', 0)} 张回收站卡片"
+                  f"（不可恢复）；回收站剩余 {d['trash_count']} 张")
+            skipped = d.get("skipped") or []
+            if skipped:
+                # 跳过必须逐条说出来：这些是「我们没能判断该不该删」的卡，
+                # 静默留着它们、只报成功，就是让人以为回收站已经清干净了。
+                print(f"跳过 {len(skipped)} 张：", file=sys.stderr)
+                for item in skipped:
+                    print(f"  {item['rel_path']}：{item.get('skip_reason', '')}",
+                          file=sys.stderr)
+        else:
+            print(f"已彻底删除 {d['rel_path']}（不可恢复）；回收站剩余 {d['trash_count']} 张")
+        if d.get("stats_dropped"):
+            print(f"  同时清掉了 {d['stats_dropped']} 条读取统计")
+        if d.get("warning"):
+            print(d["warning"], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
+
+
 def cmd_mcp(args) -> int:
     """启动 MCP stdio server。stdout 是协议通道，日志走 stderr。"""
     return mcp_server.serve()
@@ -505,6 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
     ps.set_defaults(func=cmd_search)
 
     pt = sub.add_parser("stats", help="统计概览")
+    pt.add_argument("--vault", help="vault 目录（用于统计回收站占用）")
     pt.add_argument("--json", action="store_true")
     pt.set_defaults(func=cmd_stats)
 
@@ -564,6 +792,25 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--vault", help="vault 目录")
     pu.add_argument("--json", action="store_true")
     pu.set_defaults(func=cmd_update)
+
+    pd = sub.add_parser(
+        "delete",
+        help="删除一张卡（默认**软删**到 .trash，可 --restore 恢复；--purge 才真删）")
+    pd.add_argument("id", nargs="?", type=int, help="卡片 id（软删时必填）")
+    pd.add_argument("--restore", metavar="REL_PATH",
+                    help="把回收站里的卡移回原位，如 03-Knowledge/某卡.md")
+    pd.add_argument("--purge", nargs="?", const="", default=None, metavar="REL_PATH",
+                    help="**彻底删除**（不可恢复），只对回收站里的生效。"
+                         "给路径只删那一张；不给则配合 --older-than / --all 批量")
+    pd.add_argument("--older-than", metavar="时长",
+                    help="与 --purge 连用：只删「删除时间」早于该时长的，如 30d / 12h")
+    pd.add_argument("--all", action="store_true",
+                    help="与 --purge 连用：清空回收站（含没有删除时间记录的条目）")
+    pd.add_argument("--force", action="store_true",
+                    help="--restore 时目标位置已存在：把占位的那张也移进回收站再恢复")
+    pd.add_argument("--vault", help="vault 目录")
+    pd.add_argument("--json", action="store_true")
+    pd.set_defaults(func=cmd_delete)
 
     return p
 

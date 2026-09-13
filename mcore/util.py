@@ -23,9 +23,38 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
-__all__ = ["parse_tags"]
+__all__ = ["parse_tags", "parse_duration"]
+
+
+def parse_duration(text: Any) -> int | None:
+    """把 ``30d`` / ``12h`` / ``45m`` / ``1d12h`` 解析成**秒数**；不是合法时长返回 ``None``。
+
+    用在两处，所以收口在这里：
+
+    - ``importer._parse_ttl`` 解析卡片 frontmatter 的 ``ttl``；
+    - 回收站清理按「删除多久了」筛选（``delete --purge --older-than 30d``）。
+
+    两处各写一份的后果不是崩溃而是**口径漂移**：一处认 ``1d12h``、另一处不认，
+    于是同一张卡在 ttl 上被认作「30 天后过期」、在清理时被判成「格式非法」——
+    两边都不报错。本项目已经因为「同一个意思、几处各写」吃过多次亏。
+
+    ``None`` 与 ``0`` 是两件事：``None`` 是「压根不是时长」（调用方该报错或忽略），
+    ``0`` 是「合法的零时长」。合并成 ``0`` 会让 ``ttl: 乱写`` 被静默当成
+    「永不过期」——那是把解析失败伪装成了成功。
+    """
+    if text is None:
+        return None
+    compact = re.sub(r"\s+", "", str(text).strip().strip("'\"").lower())
+    if not compact:
+        return None
+    parts = re.findall(r"(\d+)([dhm])", compact)
+    # 「整串都由 数字+单位 组成」才算合法：`1d12h30m` 可以，`30days` 不行。
+    if not parts or "".join(f"{n}{u}" for n, u in parts) != compact:
+        return None
+    return sum(int(v) * {"d": 86400, "h": 3600, "m": 60}[u] for v, u in parts)
 
 
 def parse_tags(raw: Any) -> list[str]:

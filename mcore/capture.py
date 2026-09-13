@@ -17,15 +17,20 @@ frontmatter 与 vault 中既有卡片完全一致，因此新旧卡片可以共�
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .util import parse_tags
 
 __all__ = ["KIND_DIRS", "DEFAULT_KIND", "CONFLICT_POLICIES", "SECRET_PATTERNS",
+           "TRASH_DIRNAME", "TRASH_REMIND_THRESHOLD",
            "write_card", "supersede_card", "update_card", "update_frontmatter",
+           "delete_card", "restore_card", "purge_card", "purge_trash",
+           "list_trash", "trash_summary",
            "scan_secrets", "scan_slug", "card_fingerprint", "slugify"]
 
 # kind -> 分类目录（与既有 vault 结构一致）
@@ -643,6 +648,45 @@ def supersede_card(
     }
 
 
+def _normalize_rel(rel_path: str) -> str:
+    """规范化调用方给的相对路径：剥掉开头的 ``./`` 与**误加的** ``.trash/`` 前缀。
+
+    **不能用 ``lstrip("./")``**：它按「字符集合」剥，会把 ``.trash/x`` 剥成
+    ``trash/x`` —— 前缀里的 ``.`` 和 ``t``… 都被当成要剥的字符。这不是假想，
+    是实测踩到的（``delete --restore .trash/xxx`` 报「回收站里没有 trash/xxx」）。
+    这里逐前缀比较，只剥真正匹配的那一个。
+    """
+    rel = Path(str(rel_path)).as_posix()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    prefix = f"{TRASH_DIRNAME}/"
+    while rel.startswith(prefix):
+        rel = rel[len(prefix):]
+    return rel
+
+
+def _resolve_in_trash(vault: Path, rel_path: str) -> tuple[Path | None, str, str]:
+    """把 ``rel_path`` 解析成回收站内的绝对路径。返回 ``(路径, 规范化后的 rel, 错误说明)``。
+
+    **必须限界，而且是硬性要求**：``Path('C:/Windows/notepad.exe')`` 是绝对路径，
+    而 ``pathlib`` 在拼接时会让绝对路径**整个取代**左边 —— ``base / 绝对路径``
+    得到的就是那个绝对路径。于是 ``purge_card`` 会去删一个 vault 之外的文件。
+    所以这里解析后必须回验「它仍在 ``.trash`` 之内」，越界一律拒绝。
+
+    同一条检查顺带挡住 ``../../`` 这类穿越（``.trash/../../x`` 解析后不在 ``.trash`` 内）。
+    """
+    rel = _normalize_rel(rel_path)
+    if not rel:
+        return None, "", "路径为空"
+    root = (vault / TRASH_DIRNAME).resolve()
+    try:
+        candidate = (root / rel).resolve()
+        candidate.relative_to(root)
+    except (ValueError, OSError):
+        return None, rel, f"路径不在回收站内：{rel_path}"
+    return candidate, rel, ""
+
+
 def _unique_path(directory: Path, slug: str) -> Path:
     """避开重名：slug.md 被占用时依次尝试 slug-2.md、slug-3.md…"""
     path = directory / f"{slug}.md"
@@ -651,6 +695,358 @@ def _unique_path(directory: Path, slug: str) -> Path:
         path = directory / f"{slug}-{n}.md"
         n += 1
     return path
+
+
+# ---------------------------------------------------------------- 软删与回收站
+#
+# 删除是**软删**：文件移到 ``<vault>/.trash/<原相对路径>``，随时可移回。
+# 真删只发生在 ``purge``，且**只对已经在 .trash 里的文件生效** ——
+# 这条约束是「`--purge` 不可能删掉一张活着的卡」的机制保证，不是靠调用方自觉。
+#
+# 为什么要按原相对路径存放：恢复时不需要任何额外记录就能算回原位；
+# 一张卡被手工放进 .trash 也能被恢复（哪怕没有清单记录）。
+TRASH_DIRNAME = ".trash"
+_TRASH_MANIFEST = ".manifest.json"
+
+
+def _trash_root(vault: Path) -> Path:
+    return vault / TRASH_DIRNAME
+
+
+def _is_inside_trash(rel: str) -> bool:
+    """判断一个 rel_path 是不是已经位于回收站内。
+
+    只认**第一段**恰好等于 ``.trash``：形近目录（``.trash-old``）不算 ——
+    模糊匹配会让「.trash-old 里的卡」被判成已删除，然后 `restore` 去找一个
+    并不存在的文件。``importer._SKIP_DIRS`` 对同一件事是同一种判法。
+    """
+    parts = Path(rel).parts
+    return bool(parts) and parts[0] == TRASH_DIRNAME
+
+
+def _read_trash_manifest(vault: Path) -> dict:
+    """读回收站清单 ``{rel_path: {"deleted_at", "trash_path"}}``。
+
+    清单**只为一件事存在**：知道「这张卡是什么时候被删的」。
+    文件的 mtime 在移动后仍是原卡片的写入时间（不能用它当删除时间），
+    所以「删除超过了 N 天才清理」这个筛选必须有独立的记录。
+
+    读不了 / 损坏就返回空字典，**不抛错**：清单不是真相源，丢了只是让
+    ``--older-than`` 失去依据 —— 那时我们**跳过并如实报告**，绝不猜。
+    """
+    try:
+        raw = (_trash_root(vault) / _TRASH_MANIFEST).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_trash_manifest(vault: Path, data: dict) -> None:
+    """写回收站清单（原子写）。它不是真相源，写失败不该让删除失败。"""
+    root = _trash_root(vault)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(root / _TRASH_MANIFEST,
+                       json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def list_trash(vault: str | Path) -> list[dict]:
+    """列出回收站里的卡片。
+
+    每条返回 ``{"rel_path", "trash_path", "deleted_at", "size"}``；
+    ``deleted_at`` 为空串表示**清单里没有它的记录**（例如手工放进来的文件）——
+    调用方必须能区分「不知道何时删的」与「很久以前删的」，
+    否则 ``--older-than`` 会把来路不明的文件当成很久以前删的而被清掉。
+    """
+    vault = Path(vault)
+    root = _trash_root(vault)
+    if not root.is_dir():
+        return []
+
+    manifest = _read_trash_manifest(vault)
+    by_trash_path = {
+        str(rec.get("trash_path", "")): (rel, rec)
+        for rel, rec in manifest.items() if isinstance(rec, dict)
+    }
+
+    out: list[dict] = []
+    for path in sorted(root.rglob("*.md")):
+        if not path.is_file():
+            continue
+        trash_rel = path.relative_to(vault).as_posix()
+        rel, rec = by_trash_path.get(trash_rel, (trash_rel[len(TRASH_DIRNAME) + 1:], {}))
+        out.append({
+            "rel_path": rel,
+            "trash_path": trash_rel,
+            "deleted_at": str(rec.get("deleted_at", "") or ""),
+            "size": path.stat().st_size,
+        })
+    return out
+
+
+def delete_card(vault: str | Path, rel_path: str) -> dict:
+    """软删一张卡：移到 ``<vault>/.trash/<原相对路径>``。返回删除结果。
+
+    **它是可逆的**，所以：
+
+    - **不清读取统计**（``card_stats``）。软删能恢复，统计跟着清掉就是清掉一份
+      没有第二个来源的数据。真正的销毁在 :func:`purge_card`。
+    - **不删任何内容**，只是搬走文件。
+
+    为什么是「移动」而不是「打个删除标记留在原地」：留在原地的卡片仍在 vault 里，
+    索引端要么得学会读标记（于是删除语义渗进索引端），要么就会继续检索到它。
+    移到 vault 之外的子目录、再把该目录排除出索引，删除语义只需要一个地方知道。
+
+    返回 ``{"ok", "rel_path", "trash_path", "deleted_at", "path", "reason"}``。
+    """
+    vault = Path(vault)
+    path = (vault / rel_path).resolve()
+    try:
+        rel = path.relative_to(vault.resolve()).as_posix()
+    except ValueError:
+        return {"ok": False, "reason": f"路径不在 vault 内：{rel_path}"}
+
+    if _is_inside_trash(rel):
+        # 重复软删会把 .trash 里的文件再套一层 .trash。
+        return {"ok": False, "rel_path": rel,
+                "reason": (f"{rel} 已经在回收站里了。"
+                           f"要彻底删除请用 delete --purge {rel}。")}
+
+    if not path.is_file():
+        return {"ok": False, "rel_path": rel, "reason": f"卡片不存在：{rel}"}
+
+    trash_rel = f"{TRASH_DIRNAME}/{rel}"
+    dest = vault / trash_rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        # 同名冲突是真实存在的：删掉一张 → 恢复 → 又写一张同名卡 → 再删。
+        # 直接覆盖会**静默销毁**回收站里那一份 —— 而回收站的全部意义就是它还在。
+        dest = _unique_path(dest.parent, dest.stem)
+        trash_rel = dest.relative_to(vault).as_posix()
+
+    # 同一卷内 os.replace 是原子的：中途失败不会留下「两处都没有」的状态。
+    # .trash 是 vault 的子目录，因此必然同卷。
+    os.replace(path, dest)
+
+    deleted_at = _now_iso()
+    manifest = _read_trash_manifest(vault)
+    manifest[rel] = {"deleted_at": deleted_at, "trash_path": trash_rel}
+    try:
+        _write_trash_manifest(vault, manifest)
+    except OSError:
+        # 清单写不进去不该让「已经搬走的文件」看起来像没删成功。
+        # 代价是这张卡的删除时间未知 —— 由 list_trash 如实报成空。
+        pass
+
+    return {
+        "ok": True,
+        "rel_path": rel,
+        "trash_path": trash_rel,
+        "deleted_at": deleted_at,
+        "path": str(dest),
+        "reason": f"已软删到 {trash_rel}（可恢复：delete --restore {rel}）",
+    }
+
+
+def restore_card(vault: str | Path, rel_path: str, *,
+                 force: bool = False) -> dict:
+    """把回收站里的卡移回原位。返回恢复结果。
+
+    ``rel_path`` 给的是**原相对路径**（``03-Knowledge/xxx.md``），不是 ``.trash/...``
+    那种全路径 —— 恢复的语义是「回到它原本待的地方」，让调用方自己拼目标路径
+    等于把「它原本在哪」这件事交给调用方记。
+
+    目标位置已存在同名卡时**默认拒绝**（覆盖是不可逆的丢失）。``force=True`` 才继续，
+    做法是**先把占位的那张也移进回收站**再恢复 —— 于是「强制恢复」也不销毁任何东西。
+
+    恢复之后**统计照旧**（软删时没清），读取次数会接上原来的计数。
+    """
+    vault = Path(vault)
+    src, rel, why = _resolve_in_trash(vault, rel_path)
+    if src is None:
+        return {"ok": False, "rel_path": rel or str(rel_path), "reason": why}
+    if not src.is_file():
+        # 回退到清单：同名冲突时实际落点带 -2 后缀，路径不再是 .trash/<rel>。
+        # 清单里的值同样要限界 —— 它是磁盘上的文件，可能被人手工改过。
+        rec = _read_trash_manifest(vault).get(rel) or {}
+        fallback, _, _ = _resolve_in_trash(vault, str(rec.get("trash_path", "")))
+        if fallback is not None and fallback.is_file():
+            src = fallback
+        else:
+            return {"ok": False, "rel_path": rel,
+                    "reason": (f"回收站里没有 {rel}。"
+                               f"可用 python memory.py stats 查看回收站张数，"
+                               f"或 delete --purge --all 清空。")}
+
+    dest = vault / rel
+    displaced = ""
+    if dest.exists():
+        if not force:
+            return {"ok": False, "rel_path": rel,
+                    "reason": (f"目标位置已有一张卡（{rel}），拒绝覆盖 —— 覆盖是不可逆的丢失。"
+                               f"确认要用回收站里这一张顶替它，请加 --force："
+                               f"（占位的那张也会先被移进回收站，不会丢）")}
+        # 强制恢复也不销毁：占位的那张先移进回收站
+        trash_rel = f"{TRASH_DIRNAME}/{rel}"
+        keep = vault / trash_rel
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        if keep.exists():
+            keep = _unique_path(keep.parent, keep.stem)
+        os.replace(dest, keep)
+        displaced = keep.relative_to(vault).as_posix()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dest)
+
+    manifest = _read_trash_manifest(vault)
+    if rel in manifest:
+        manifest.pop(rel, None)
+        try:
+            _write_trash_manifest(vault, manifest)
+        except OSError:
+            pass
+
+    result = {
+        "ok": True,
+        "rel_path": rel,
+        "path": str(dest),
+        "reason": f"已从回收站恢复到 {rel}",
+    }
+    if displaced:
+        result["displaced"] = displaced
+        result["note"] = (f"原占位的卡片已移进回收站：{displaced}（没有销毁任何内容）")
+    return result
+
+
+def purge_card(vault: str | Path, rel_path: str) -> dict:
+    """彻底删除回收站里的一张卡（不可恢复）。返回删除结果。
+
+    **只对已经在 ``.trash`` 里的文件生效。** 传一个活着的卡路径进来会被拒绝 ——
+    这不是靠调用方自觉，而是这个函数唯一能删除的位置就是回收站。
+    """
+    vault = Path(vault)
+    src, rel, why = _resolve_in_trash(vault, rel_path)
+    if src is None:
+        return {"ok": False, "rel_path": rel or str(rel_path), "reason": why}
+    if not src.is_file():
+        rec = _read_trash_manifest(vault).get(rel) or {}
+        fallback, _, _ = _resolve_in_trash(vault, str(rec.get("trash_path", "")))
+        if fallback is not None and fallback.is_file():
+            src = fallback
+        else:
+            live = vault / rel
+            if live.is_file():
+                return {"ok": False, "rel_path": rel,
+                        "reason": (f"{rel} 是一张活着的卡片，不是回收站里的 —— "
+                                   f"purge 只能彻底删除回收站里的内容。"
+                                   f"要软删它请先 delete {rel}。")}
+            return {"ok": False, "rel_path": rel,
+                    "reason": f"回收站里没有 {rel}"}
+
+    size = src.stat().st_size
+    src.unlink()
+    _prune_empty_dirs(src.parent, vault / TRASH_DIRNAME)
+
+    manifest = _read_trash_manifest(vault)
+    if rel in manifest:
+        manifest.pop(rel, None)
+        try:
+            _write_trash_manifest(vault, manifest)
+        except OSError:
+            pass
+
+    return {"ok": True, "rel_path": rel, "purged_bytes": size,
+            "reason": f"已彻底删除 {rel}（不可恢复）"}
+
+
+def _prune_empty_dirs(start: Path, stop: Path) -> None:
+    """删完后把空目录往上收掉，但**不碰 stop 本身**。
+
+    回收站留着空目录不会出错，但会让人以为「里面还有东西」；
+    而 ``.trash`` 本身要留下 —— 它是这个功能的落点。
+    """
+    current = start
+    while current != stop and stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _parse_trash_time(raw: str) -> float | None:
+    """把清单里的 ``deleted_at``（``2026-09-13T00:48:58.402Z``）解析成 unix 秒。
+
+    解析不了返回 ``None``：调用方据此把这张卡**跳过并报出来**，而不是当成
+    「很久以前删的」。猜测会直接导致文件被删掉 —— 那是不可逆的，
+    所以这里的取向是「宁可不清，也不误清」。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(text, fmt).replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def purge_trash(vault: str | Path, *, older_seconds: int | None = None,
+                everything: bool = False, now_ts: float | None = None) -> dict:
+    """批量彻底删除回收站内容。返回 ``{"ok", "purged", "skipped", ...}``。
+
+    **必须显式给一个筛选条件**（``everything=True`` 或 ``older_seconds``）：
+    没有条件就等于「清空回收站」，而那种操作不该由一个手滑的命令触发。
+
+    ``deleted_at`` 缺失或解析不了的条目在 ``older_seconds`` 模式下会被**跳过**，
+    并在 ``skipped`` 里说明原因。``everything=True`` 则连它们一起删 ——
+    「清空」是明确的意图，不需要再拿时间当判据。
+    """
+    vault = Path(vault)
+    if not everything and older_seconds is None:
+        return {"ok": False, "purged": [], "skipped": [],
+                "reason": "批量彻底删除必须给条件：--older-than <时长> 或 --all"}
+
+    now = time.time() if now_ts is None else now_ts
+    purged: list[dict] = []
+    skipped: list[dict] = []
+
+    for entry in list_trash(vault):
+        if not everything:
+            stamp = _parse_trash_time(entry["deleted_at"])
+            if stamp is None:
+                skipped.append({**entry,
+                                "skip_reason": "清单里没有这张卡的删除时间，无法判断是否超期"})
+                continue
+            if now - stamp < int(older_seconds or 0):
+                continue  # 还没到期，安静留着
+
+        res = purge_card(vault, entry["rel_path"])
+        if res["ok"]:
+            purged.append(entry)
+        else:
+            skipped.append({**entry, "skip_reason": res["reason"]})
+
+    return {"ok": True, "purged": purged, "skipped": skipped,
+            "count": len(purged),
+            "reason": f"已彻底删除 {len(purged)} 张回收站卡片"}
+
+
+def trash_summary(vault: str | Path) -> dict:
+    """回收站概览，供 ``delete`` 与 ``stats`` 提醒用。
+
+    A3 的决定是「**不自动清理**，攒到一定量提醒用户清理」，所以这里只数、不动手。
+    """
+    entries = list_trash(vault)
+    unknown = sum(1 for e in entries if not e["deleted_at"])
+    return {"count": len(entries), "unknown_deleted_at": unknown,
+            "bytes": sum(e["size"] for e in entries)}
+
+
+# 攒到多少张就该提醒 —— 只是提示阈值，不影响任何行为（不自动清理）。
+TRASH_REMIND_THRESHOLD = 10
 
 
 def card_fingerprint(title: str, body: str) -> str:

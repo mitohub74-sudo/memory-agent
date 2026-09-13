@@ -43,7 +43,7 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcore import capture, config, importer, mcp_server, readtext, search, store, util  # noqa: E402
+from mcore import capture, config, importer, mcp_server, readtext, search, store  # noqa: E402
 from mcore.util import parse_tags  # noqa: E402
 from mcore.version import __version__  # noqa: E402
 
@@ -249,10 +249,7 @@ def cmd_stats(args) -> int:
         trash = d["trash"]
         if trash["count"]:
             print(f"回收站 {trash['count']} 张 · {trash['bytes'] / 1024:.1f} KB"
-                  f"（不自动清理：python memory.py delete --purge --older-than 30d）")
-            if trash["unknown_deleted_at"]:
-                print(f"  其中 {trash['unknown_deleted_at']} 张没有删除时间记录，"
-                      f"--older-than 会跳过它们", file=sys.stderr)
+                  f"（不自动清理：delete --purge <路径> 逐张删，--purge --all 清空）")
 
     _emit(payload, args.json, render)
     return 0
@@ -494,7 +491,7 @@ def cmd_delete(args) -> int:
 
     - ``delete <id>``：移到 ``<vault>/.trash/<原相对路径>``，可恢复。**保留读取统计**；
     - ``delete --restore <rel_path>``：把回收站里的卡移回原位；
-    - ``delete --purge [<rel_path> | --older-than 30d | --all]``：**彻底删除**，
+    - ``delete --purge [<rel_path> | --all]``：**彻底删除**，
       只对回收站里的内容生效 —— 这条约束是「purge 不可能删掉一张活着的卡」的机制保证。
     """
     vault = config.vault_path(args.vault)
@@ -562,7 +559,9 @@ def _delete_soft(args, vault) -> int:
     if summary["count"] >= capture.TRASH_REMIND_THRESHOLD:
         payload["reminder"] = (
             f"回收站已积累 {summary['count']} 张卡（{summary['bytes'] / 1024:.1f} KB）。"
-            f"确认不再需要后可清理：python memory.py delete --purge --older-than 30d"
+            f"回收站不自动清理。确认不再需要后可清理："
+            f"逐张 python memory.py delete --purge <rel_path>，"
+            f"或整体清空 python memory.py delete --purge --all"
         )
 
     def render(d):
@@ -619,32 +618,16 @@ def _delete_restore(args, vault) -> int:
 
 
 def _delete_purge(args, vault) -> int:
-    if args.older_than and args.all:
-        payload = {"ok": False, "error": "--older-than 与 --all 互斥："
-                                    "前者按删除时间筛选，后者是清空回收站。"}
-        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
-        return 1
-
     if not args.purge:
-        # 批量：必须显式给条件。没有条件等于「清空回收站」，
-        # 那种操作不该由一次手滑触发。
-        older_seconds = None
-        if args.older_than:
-            older_seconds = util.parse_duration(args.older_than)
-            if older_seconds is None:
-                payload = {"ok": False,
-                           "error": f"无法识别的时长：{args.older_than!r}。"
-                                    f"可用 30d / 12h / 45m / 1d12h。"}
-                _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
-                return 1
-        if not args.all and older_seconds is None:
+        # 清空回收站：必须显式给 --all。这是不可逆的批量销毁，
+        # 不该由一次手滑的命令触发。
+        if not args.all:
             payload = {"ok": False,
-                       "error": "批量彻底删除必须给条件：--older-than <时长> 或 --all。"
-                                "（只删一张请给路径：delete --purge <rel_path>）"}
+                       "error": "清空回收站需要显式给 --all（不可恢复）。"
+                                "只删一张请给路径：delete --purge <rel_path>"}
             _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
             return 1
-        result = capture.purge_trash(vault, older_seconds=older_seconds,
-                                     everything=args.all)
+        result = capture.purge_trash(vault, everything=True)
         rels = [e["rel_path"] for e in result.get("purged", [])]
     else:
         result = capture.purge_card(vault, args.purge)
@@ -912,11 +895,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="把回收站里的卡移回原位，如 03-Knowledge/某卡.md")
     pd.add_argument("--purge", nargs="?", const="", default=None, metavar="REL_PATH",
                     help="**彻底删除**（不可恢复），只对回收站里的生效。"
-                         "给路径只删那一张；不给则配合 --older-than / --all 批量")
-    pd.add_argument("--older-than", metavar="时长",
-                    help="与 --purge 连用：只删「删除时间」早于该时长的，如 30d / 12h")
+                         "给路径只删那一张；不给则配合 --all 清空回收站")
     pd.add_argument("--all", action="store_true",
-                    help="与 --purge 连用：清空回收站（含没有删除时间记录的条目）")
+                    help="与 --purge 连用：清空回收站（不可恢复，必须显式给出）")
     pd.add_argument("--force", action="store_true",
                     help="--restore 时目标位置已存在：把占位的那张也移进回收站再恢复")
     pd.add_argument("--vault", help="vault 目录")

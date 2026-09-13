@@ -23,7 +23,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 from mcore import capture, importer, search, store
@@ -89,9 +88,11 @@ def test_soft_delete_moves_the_file_and_keeps_it_intact() -> None:
         assert trashed.is_file()
         assert trashed.read_bytes() == before, "回收站里的内容必须与原文件完全一致"
 
-        # 清单要记下删除时间（--older-than 唯一的判据来源）
-        manifest = json.loads((vault / ".trash" / ".manifest.json").read_text("utf-8"))
-        assert manifest[rel]["deleted_at"] == res["deleted_at"], manifest
+        # ★ 回收站里**只有卡片**，不放任何别的文件（2026-09-13 用户决定）。
+        # 这条是机器可验的：回收站根目录下多出任何一个文件都算违反。
+        extra = sorted(x.name for x in (vault / ".trash").iterdir() if x.is_file())
+        assert extra == [], f"回收站里出现了额外的文件：{extra}"
+        assert "deleted_at" not in res, f"不再记录删除时间：{res}"
 
 
 def test_soft_delete_keeps_the_read_counts() -> None:
@@ -413,61 +414,80 @@ def test_purge_trash_requires_an_explicit_condition() -> None:
 
         res = capture.purge_trash(vault)
         assert res["ok"] is False, res
-        assert "必须给条件" in res["reason"], res
+        assert "--all" in res["reason"], res
         assert (vault / ".trash" / rel).exists(), "被拒绝时不该删任何东西"
 
 
-def test_purge_trash_older_than_keeps_recent_entries() -> None:
+def test_older_than_is_gone_by_decision() -> None:
+    """★ 「按天数清理」已被**用户决定去掉** —— 这里把它钉死，防止以后被悄悄加回来。
+
+    去掉的原因：判据（这张卡什么时候被删的）没有可靠来源 —— 文件的 mtime 在移动后
+    仍是原卡片的写入时间；而为了它去 vault 里新增一个非 Markdown 文件，
+    代价大于收益。彻底删除现在只有两种，都由人显式发起：按路径逐张、或清空回收站。
+
+    这条测试同时锁两件事：库层不再有这个参数，命令行不再有这个开关。
+    """
+    import inspect
+    sig = inspect.signature(capture.purge_trash)
+    assert "older_seconds" not in sig.parameters, (
+        f"purge_trash 又长出了按时间筛选的参数：{list(sig.parameters)}"
+    )
+    assert "now_ts" not in sig.parameters, list(sig.parameters)
+
+
+def test_cli_delete_has_no_older_than_option() -> None:
+    """命令行也不该有这个开关 —— 传了必须是「不认识的参数」，而不是被静默忽略。"""
     with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
         root = Path(raw)
-        vault, path, rel = _seed(root)
-        assert capture.delete_card(vault, rel)["ok"] is True
+        vault = root / "vault"
+        vault.mkdir(parents=True)
+        env = _cli_env(root, vault)
 
-        res = capture.purge_trash(vault, older_seconds=30 * DAY)
-        assert res["ok"] is True, res
-        assert res["count"] == 0, res
-        assert (vault / ".trash" / rel).exists(), "还没到期的不该被删"
-
-
-def test_purge_trash_older_than_deletes_expired_entries() -> None:
-    with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
-        root = Path(raw)
-        vault, path, rel = _seed(root)
-        assert capture.delete_card(vault, rel)["ok"] is True
-
-        # 把「现在」推到 60 天之后，于是这张卡算是 60 天前删的
-        res = capture.purge_trash(vault, older_seconds=30 * DAY,
-                                  now_ts=time.time() + 60 * DAY)
-        assert res["ok"] is True, res
-        assert res["count"] == 1, res
-        assert not (vault / ".trash" / rel).exists()
+        r = _run_cli(env, "delete", "--purge", "--older-than", "30d", "--json")
+        assert r.returncode == 2, f"未识别的参数应当让 argparse 报错：{r.returncode} {r.stdout}"
 
 
-def test_purge_trash_skips_entries_without_a_delete_time() -> None:
-    """★ 没有删除时间记录的条目在 ``--older-than`` 下**跳过并报出**，绝不猜。
+def test_trash_never_contains_anything_but_cards() -> None:
+    """★ 回收站里**永远只有卡片**（用户决定：不新增任何辅助文件）。
 
-    手工放进 ``.trash`` 的文件（或清单丢了）没有删除时间。把它当成「很久以前删的」
-    会直接删掉一个来路不明的文件 —— 不可逆，所以这里的取向是「宁可不清，也不误清」。
+    软删、恢复、彻底删除三条路径跑一遍之后各查一次。多出任何文件都算违反 ——
+    「回收站只是个放卡片的地方」这条约定，靠这个断言才守得住。
     """
     with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
         root = Path(raw)
         vault, path, rel = _seed(root)
-        # 手工放一个没有清单记录的文件进回收站
-        manual = vault / ".trash" / "03-Knowledge" / "手工放进来.md"
+
+        def extra_files() -> list[str]:
+            root_dir = vault / ".trash"
+            if not root_dir.is_dir():
+                return []
+            return sorted(x.name for x in root_dir.iterdir() if x.is_file())
+
+        assert capture.delete_card(vault, rel)["ok"] is True
+        assert extra_files() == [], extra_files()
+
+        assert capture.restore_card(vault, rel)["ok"] is True
+        assert extra_files() == [], extra_files()
+
+        assert capture.delete_card(vault, rel)["ok"] is True
+        assert capture.purge_card(vault, rel)["ok"] is True
+        assert extra_files() == [], extra_files()
+
+        # 手工放进来的卡片也能被恢复/清除，同样不产生任何辅助文件
+        manual = vault / ".trash" / "03-Knowledge" / "手工.md"
         manual.parent.mkdir(parents=True, exist_ok=True)
-        manual.write_text("---\ntitle: 手工放进来\nkind: knowledge\n---\n\n正文足够长。\n",
+        manual.write_text("---\ntitle: 手工\nkind: knowledge\n---\n\n正文足够长。\n",
                           encoding="utf-8")
-
-        res = capture.purge_trash(vault, older_seconds=1, now_ts=time.time() + 999 * DAY)
-        assert res["ok"] is True, res
-        assert res["count"] == 0, res
-        assert len(res["skipped"]) == 1, res
-        assert "没有这张卡的删除时间" in res["skipped"][0]["skip_reason"], res
-        assert manual.is_file(), "来路不明的文件不该被删掉"
+        assert extra_files() == [], extra_files()
+        assert capture.purge_trash(vault, everything=True)["count"] == 1
+        assert capture.list_trash(vault) == []
 
 
-def test_purge_trash_all_includes_entries_without_a_delete_time() -> None:
-    """``--all`` 是明确的「清空」意图，不再拿时间当判据，于是全部清掉。"""
+def test_purge_trash_all_clears_everything_including_hand_placed_files() -> None:
+    """``--all`` 是明确的「清空」意图，回收站里有什么就清什么。
+
+    包括**手工放进来的**卡片（没有经过软删流程的那些）——
+    清空回收站不需要猜它们的来历，删掉就是删掉。"""
     with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
         root = Path(raw)
         vault, path, rel = _seed(root)
@@ -483,20 +503,18 @@ def test_purge_trash_all_includes_entries_without_a_delete_time() -> None:
         assert capture.list_trash(vault) == []
 
 
-def test_trash_summary_counts_entries_and_flags_unknown_times() -> None:
+def test_trash_summary_counts_entries_and_bytes() -> None:
+    """概览只报**张数与体积** —— 不报「什么时候删的」，因为回收站里没有这个信息。"""
     with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
         root = Path(raw)
         vault, path, rel = _seed(root)
-        assert capture.trash_summary(vault) == {"count": 0, "unknown_deleted_at": 0,
-                                                "bytes": 0}
+        assert capture.trash_summary(vault) == {"count": 0, "bytes": 0}
         assert capture.delete_card(vault, rel)["ok"] is True
         summary = capture.trash_summary(vault)
         assert summary["count"] == 1, summary
         assert summary["bytes"] > 0, summary
-
-        manual = vault / ".trash" / "03-Knowledge" / "手工.md"
-        manual.write_text("x" * 10, encoding="utf-8")
-        assert capture.trash_summary(vault)["unknown_deleted_at"] == 1
+        # 不谎报删不出来的东西：以前这里还有个 unknown_deleted_at 字段
+        assert set(summary) == {"count", "bytes"}, summary
 
 
 # ------------------------------------------------------------------ CLI 端到端
@@ -617,7 +635,7 @@ def test_cli_purge_clears_the_read_counts_it_left_behind() -> None:
             conn.close()
 
 
-def test_cli_purge_without_condition_explains_what_is_missing() -> None:
+def test_cli_purge_without_a_target_explains_what_is_missing() -> None:
     with tempfile.TemporaryDirectory(prefix="memory-agent-del-") as raw:
         root = Path(raw)
         vault = root / "vault"
@@ -629,12 +647,8 @@ def test_cli_purge_without_condition_explains_what_is_missing() -> None:
         assert r.returncode == 1, f"{r.returncode} {r.stdout}"
         payload = json.loads(r.stdout)
         assert payload["ok"] is False, payload
-        assert "必须给条件" in payload["error"], payload
-
-        # 错误的时长写法也要被明确拒绝，而不是被当成 0 天
-        r = _run_cli(env, "delete", "--purge", "--older-than", "30days", "--json")
-        assert r.returncode == 1, f"{r.returncode} {r.stdout}"
-        assert "无法识别的时长" in json.loads(r.stdout)["error"], r.stdout
+        assert "--all" in payload["error"], payload
+        assert "不可恢复" in payload["error"], payload
 
 
 def test_cli_stats_shows_the_trash_and_the_reminder_appears_over_threshold() -> None:
@@ -666,7 +680,9 @@ def test_cli_stats_shows_the_trash_and_the_reminder_appears_over_threshold() -> 
         payload = json.loads(r.stdout)
         assert payload["trash_count"] == threshold, payload
         assert "reminder" in payload, payload
-        assert "--purge --older-than" in payload["reminder"], payload
+        # 提醒必须给出**当时真正可用**的清法，且必须点明「不自动清理」
+        assert "--purge --all" in payload["reminder"], payload
+        assert "不自动清理" in payload["reminder"], payload
 
         # 回收站**没有被自动清理** —— 提醒归提醒，动手要人来
         assert capture.trash_summary(vault)["count"] == threshold

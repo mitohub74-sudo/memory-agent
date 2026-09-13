@@ -104,12 +104,13 @@ python memory.py paths                # 当前生效路径
 python memory.py index [--rebuild]    # 同步 / 重建索引
 python memory.py search <query>       # 检索
 python memory.py capture --title T --body B   # 写入一张卡片
+python memory.py update <id> --body B         # 原地改一张卡（见「更新」一节）
 python memory.py stats                # 统计
 python memory.py show <id>            # 卡片全文（长卡默认分片，见下）
 python memory.py mcp                  # 启动 MCP server
 ```
 
-所有命令支持 `--json`。退出码：`0` 成功，`1` 无结果，`2` 环境错误，
+所有命令支持 `--json`。退出码：`0` 成功，`1` 无结果 / 被拒绝，`2` 环境错误，
 `3` 标题撞车被拒绝（`--on-conflict reject`）。
 
 ### 长卡分片读取
@@ -169,6 +170,38 @@ python memory.py capture --title "标题" --body "正文" [--kind knowledge] [--
 | 正文/标题含疑似凭据 | **仍然写入**，但回传 `secrets_found` + `warnings`（默认只告警） |
 | `--reject-secrets` 下含疑似凭据 | 不写盘，返回 `rejected`，退出码 **1** |
 | 索引失败 | 卡片仍在磁盘（真相源优先），返回 `indexed: false` + `warning` |
+
+### 更新：事实本身写错了
+
+```bash
+python memory.py update 12 --body "新的正文"           # 只改正文
+python memory.py update 12 --title "新标题" --tags a,b  # 只改给定的字段
+python memory.py update 12 --priority 5 --ttl 30d
+```
+
+**它与「取代」（`supersede`）的分工** —— 选错会让历史静默消失：
+
+| 场景 | 用哪个 | 为什么 |
+|---|---|---|
+| 事实**写错了**（错别字、漏了参数、路径写错） | `update` | 没有「当时是对的」这回事，历史没有价值 |
+| 事实**变了**（服务迁址、端口改了、价格变了） | `supersede` | 「当时是多少」以后还要能回答 |
+
+行为约定（每条都有对应测试）：
+
+- **只改传进来的字段**，其余 frontmatter 行、未知字段、正文一字不动；
+- `updated` 刷新，`created` **不动**；
+- **路径不变**（改标题也不改文件名）。`rel_path` 是取代关系与读取统计的锚点，
+  移动文件会让它们对不上 —— 代价是文件名可能与标题不一致，这一点会回传在 `note` 里；
+- **给定值与现值相同时不写盘**，返回 `changed: []`。不做假动作，也不谎称改过；
+- **拒绝改 `--kind`**：`kind` 决定卡片所在目录，改它等于移动文件。这是**故意的不支持** ——
+  报错并提示「先 `supersede` 出新类型的新卡，再 `delete` 旧卡」，而不是静默忽略；
+- 正文长度门槛与 `capture` **同一道**（< 20 字符拒绝）。两处门槛不同的后果是
+  「同一份内容换个入口就能进来」，而两个入口都返回成功；
+- `indexed` 三态：`true` 已重新索引 / `false` 写盘成功但索引失败（见 `warning`）/
+  `null` 没有字段变化、未写盘。**不用 `false` 兼表「没变化」**，否则调用方会把
+  「什么都没改」错读成「索引坏了」；
+- **不从 stdin 读正文**：`--body` 不给就是「不动正文」。否则「没打算改正文」
+  会变成「把管道内容当成新正文写进去」。
 
 ### 敏感内容：默认只告警，不阻断
 

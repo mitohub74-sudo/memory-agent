@@ -356,6 +356,89 @@ def cmd_capture(args) -> int:
     return 0
 
 
+def cmd_update(args) -> int:
+    """原地修改一张卡（P3-02）。
+
+    两个入口的分工写在帮助里，因为这是调用方最容易选错的地方：
+    **事实写错了用 update，事实变了用 supersede**（后者保留「当时是多少」）。
+
+    先用 id 在索引里查出 rel_path，再按路径改文件 —— id 是 rowid，
+    ``index --rebuild`` 后会重排，不能拿它当落盘依据。
+    """
+    db = config.db_path(args.db)
+    if not _require_db(db, args.json):
+        return 2
+
+    conn = store.connect(db)
+    row = store.get_card(conn, args.id)
+    conn.close()
+
+    if row is None:
+        payload = {"ok": False, "error": f"找不到 id={args.id}"}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 1
+
+    vault = config.vault_path(args.vault)
+    # tags 必须区分「没传」（None，别动）与「传了空串」（清空标签）。
+    # 写成 `or None` 就会把后者也当成前者，于是「清空标签」静默失效。
+    result = capture.update_card(
+        vault,
+        row["rel_path"],
+        title=args.title,
+        body=args.body,
+        kind=args.kind,
+        tags=parse_tags(args.tags) if args.tags is not None else None,
+        priority=args.priority,
+        ttl=args.ttl,
+        source=args.source,
+    )
+
+    if not result["ok"]:
+        _emit(result, args.json,
+              lambda d: print(f"未改动：{d['reason']}", file=sys.stderr))
+        return 1
+
+    # indexed 三态，刻意不用 false 表示「没变化」：
+    #   true  已重新索引
+    #   false 写盘成功但索引失败（见 warning）
+    #   null  没有字段变化，未写盘、无需索引
+    # 用 false 兼表后两者，调用方会把「什么都没改」错读成「索引坏了」。
+    indexed: bool | None = None
+    warning = ""
+    if result["changed"]:
+        try:
+            conn = store.connect(db)
+            store.init(conn)
+            importer.sync_one(conn, vault, result["path"])
+            # 提交统一走自带锁重试的 store.commit，不要裸 conn.commit()。
+            store.commit(conn)
+            conn.close()
+            indexed = True
+        except Exception as exc:
+            indexed = False
+            warning = (f"卡片已改（{result['path']}），但索引失败：{exc}。"
+                       f"可运行 python memory.py index 补建。")
+
+    payload = {"id": row["id"], **result, "indexed": indexed}
+    if warning:
+        payload["warning"] = warning
+
+    def render(d):
+        if not d["changed"]:
+            print(f"未改动：{d['reason']}")
+        else:
+            mark = "已索引" if d["indexed"] else "未索引"
+            print(f"已更新 {d['path']}  [{mark}]")
+            print(f"  改动字段：{'、'.join(d['changed'])}")
+        # note / warning 走 stderr：stdout 是结果，这两条是旁路提示。
+        for key in ("note", "warning"):
+            if d.get(key):
+                print(d[key], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
+
+
 def cmd_mcp(args) -> int:
     """启动 MCP stdio server。stdout 是协议通道，日志走 stderr。"""
     return mcp_server.serve()
@@ -464,6 +547,23 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--vault", help="vault 目录")
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_capture)
+
+    pu = sub.add_parser(
+        "update",
+        help="原地修改一张卡（事实本身写错了用这个；事实变了用 supersede）")
+    pu.add_argument("id", type=int, help="卡片 id，来自 search 结果")
+    pu.add_argument("--title", help="新标题；文件**不会**改名（路径是取代与统计的锚点）")
+    pu.add_argument("--body", help="新正文。**不给就不动正文** —— 刻意不从 stdin 读，"
+                                   "否则「没打算改正文」会变成「把管道内容写成正文」")
+    pu.add_argument("--kind", help="**只用来显式报错**：不支持改类型，"
+                                   "因为 kind 决定卡片目录、改它等于移动文件")
+    pu.add_argument("--tags", help="标签，逗号分隔；传空字符串表示清空标签")
+    pu.add_argument("--priority", type=int, help="优先级（整数）")
+    pu.add_argument("--ttl", help="有效期，如 30d / 12h / 2026-10-01；空字符串表示永不过期")
+    pu.add_argument("--source", help="来源标记")
+    pu.add_argument("--vault", help="vault 目录")
+    pu.add_argument("--json", action="store_true")
+    pu.set_defaults(func=cmd_update)
 
     return p
 

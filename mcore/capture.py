@@ -22,9 +22,11 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .util import parse_tags
+
 __all__ = ["KIND_DIRS", "DEFAULT_KIND", "CONFLICT_POLICIES", "SECRET_PATTERNS",
-           "write_card", "supersede_card", "update_frontmatter", "scan_secrets",
-           "scan_slug", "card_fingerprint", "slugify"]
+           "write_card", "supersede_card", "update_card", "update_frontmatter",
+           "scan_secrets", "scan_slug", "card_fingerprint", "slugify"]
 
 # kind -> 分类目录（与既有 vault 结构一致）
 KIND_DIRS: dict[str, str] = {
@@ -193,6 +195,22 @@ def _yaml_list(items: list[str]) -> str:
     return "[" + ", ".join(out) + "]"
 
 
+def _yaml_scalar(value: str) -> str:
+    """渲染一个 frontmatter 标量。
+
+    含冒号或引号时加引号（否则值里的 ``:`` 会把这一行变成嵌套结构）。
+    空值写成 ``""`` 而不是留空 —— ``key: `` 这种写法末尾挂着一个看不见的空格，
+    而且与「字段不存在」在肉眼上难以区分。
+
+    ``update_card`` 与 ``_render`` 共用它：两处各写一份引号规则，迟早在某个
+    含冒号的标题上分叉，而分叉出来的两份 frontmatter 都「看起来正常」。
+    """
+    text = str(value)
+    if not text:
+        return '""'
+    return f'"{text}"' if any(c in text for c in ':"') else text
+
+
 def _render(title: str, body: str, kind: str, tags: list[str], source: str,
             status: str, severity: str, reason: str, ts: str,
             *, supersedes: str = "", invalid_at: str = "",
@@ -210,7 +228,7 @@ def _render(title: str, body: str, kind: str, tags: list[str], source: str,
         "---",
         f"formatVersion: {FORMAT_VERSION}",
         f"kind: {kind}",
-        f'title: "{title}"' if any(c in title for c in ':"') else f"title: {title}",
+        f"title: {_yaml_scalar(title)}",
         f"tags: {_yaml_list(tags)}",
         f"created: {ts}",
         f"updated: {ts}",
@@ -229,6 +247,79 @@ def _render(title: str, body: str, kind: str, tags: list[str], source: str,
         fm.append(f"superseded_by: {superseded_by}")
     fm += ["---", ""]
     return "\n".join(fm) + body.strip() + "\n"
+
+
+def _split_card_text(text: str) -> tuple[list[str], str] | None:
+    """把卡片文本切成 ``(frontmatter 行, 正文)``；没有 frontmatter 段时返回 None。
+
+    行列表**含首尾两条 ``---``**，所以行列表最后一项的下标就是结束分隔符的下标。
+    与 :func:`update_frontmatter` 里的判定同一套规则（剥 BOM、找第二条 ``---``）——
+    两处各写一遍的话，迟早有一处忘了剥 BOM，于是同一个文件在一处能改、在另一处
+    「没有 frontmatter」，而两边都不报错。
+    """
+    stripped = text.lstrip("\ufeff")
+    lines = stripped.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return lines[: i + 1], "\n".join(lines[i + 1 :])
+    return None
+
+
+def _apply_frontmatter_updates(lines: list[str], end: int, updates: dict) -> list[str]:
+    """逐行替换 ``key: ...``，缺失的键追加在结束分隔符之前。返回新的行列表。
+
+    **只动给定的键。** 未知字段（别的工具加的、旧实验字段）原样留在原位置 ——
+    整份重渲染会把它们抹掉，而「抹掉别人写的东西」不可逆且不报错。
+    新键追加时保持原有键的相对顺序，让 diff 只体现真正改动的行。
+    """
+    remaining = dict(updates)
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if i == end:
+            # 结束分隔符之前，把没找到的键补上（保持原有键的相对顺序）
+            for key, value in remaining.items():
+                out.append(f"{key}: {value}")
+            remaining.clear()
+            out.append(line)
+            continue
+        if 0 < i < end and ":" in line:
+            key = line.split(":", 1)[0].strip()
+            if key in remaining:
+                out.append(f"{key}: {remaining.pop(key)}")
+                continue
+        out.append(line)
+    return out
+
+
+# 幂等比对用的指纹标记（frontmatter 之后、正文末尾的 HTML 注释）。
+#
+# 抽成常量是因为**改卡片时必须把它一起重算**：`_matches_fingerprint` 的第一条判据
+# 就是「文件里有 contentHash: <新指纹>」。只改正文不重算标记的后果是静默的 ——
+# 卡片内容变了，但去重判据还指着旧值，于是同一份内容再写一次会被判定为「新内容」，
+# 库里悄悄多出一张重复卡。
+_HASH_COMMENT_RE = re.compile(r"<!--\s*contentHash:\s*[0-9a-fA-F]+\s*-->")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写：先写同目录临时文件再改名，避免中途失败留下半截卡片。
+
+    采集端原有的三处写盘（``write_card`` / ``update_frontmatter`` / 本次新增的
+    ``update_card``）共用它。三处各写一遍的话，总有一处会忘记「失败时清掉临时文件」，
+    而 ``.md.tmp`` 残留会被下一次 ``rglob("*.md")`` 忽略（扩展名不是 .md），
+    所以这种疏漏**不会报错**，只会悄悄在 vault 里堆垃圾文件。
+    """
+    tmp = path.with_suffix(".md.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def update_frontmatter(path: Path, updates: dict) -> bool:
@@ -264,40 +355,204 @@ def update_frontmatter(path: Path, updates: dict) -> bool:
     if end is None:
         return False
 
-    remaining = dict(updates)
-    out: list[str] = []
-    for i, line in enumerate(lines):
-        if i == end:
-            # 结束分隔符之前，把没找到的键补上（保持原有键的相对顺序）
-            for key, value in remaining.items():
-                out.append(f"{key}: {value}")
-            remaining.clear()
-            out.append(line)
-            continue
-        if 0 < i < end and ":" in line:
-            key = line.split(":", 1)[0].strip()
-            if key in remaining:
-                out.append(f"{key}: {remaining.pop(key)}")
-                continue
-        out.append(line)
-
-    new_text = "\n".join(out)
-    if not stripped.startswith("---"):  # pragma: no cover - 上面已 return
-        new_text = stripped
+    new_text = "\n".join(_apply_frontmatter_updates(lines, end, updates))
     if new_text == stripped:
         return False  # 没有任何变化，不必写盘（也避免无谓地改动 mtime）
 
-    tmp = path.with_suffix(".md.tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    _atomic_write_text(path, new_text)
     return True
+
+
+def update_card(
+    vault: str | Path,
+    rel_path: str,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    kind: str | None = None,
+    tags: list[str] | None = None,
+    priority: int | None = None,
+    ttl: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """原地修改一张已存在的卡片（P3-02）。返回 ``{"ok", "changed", ...}``。
+
+    与 :func:`supersede_card` 的分工 —— 这是调用方最容易选错的地方，所以写清楚：
+
+    - **事实本身就写错了**（错别字、错误的路径、漏了参数）→ 用 ``update_card``，
+      因为没有「当时是对的」这回事，历史没有价值；
+    - **事实变了**（服务迁了地址、端口换了）→ 用 ``supersede_card``，
+      因为「当时是多少」以后还要能回答。
+
+    **只改传进来的字段。** 其余 frontmatter 行、未知字段、正文一字不动 ——
+    卡片可能是人手工写的、可能带别的工具加的字段，整份重渲染会把它们抹掉。
+
+    几条刻意的不支持 / 约定：
+
+    1. **拒绝改 ``kind``**。``kind`` 决定卡片所在目录，改它等于移动文件；
+       而 ``rel_path`` 是取代关系与 ``card_stats`` 的锚点（``id`` 是 rowid，
+       ``index --rebuild`` 后会重排，不能当锚点）。想换类型就 supersede 出新卡再删旧卡。
+       这是**故意的不支持**：静默忽略 ``kind`` 比报错更坏 —— 调用方会以为改成了。
+    2. **改标题不动文件**。``title`` 只改 frontmatter 里的那一行，文件名保持不变。
+       理由同上：路径是锚点。代价是文件名与标题可能不一致，这一点会写在返回值里。
+
+       **已知代价（如实记录，不假装没有）**：``write_card`` 的重复判定是按
+       **文件名的 slug** 找同族文件的（``scan_slug``）。改了标题而文件名没改之后，
+       再用**新标题** capture 同一份内容，会落到另一个 slug 空间里、
+       因而产生一张新卡。要避免它，就别用新标题去重写同一张卡 ——
+       改标题的场景本就少见，而「为了去重而重命名文件」会打断取代关系与统计。
+    3. **``updated`` 会被刷新，``created`` 保持不变。** 只有当确实有字段变了才写盘 ——
+       没有变化时不刷新时间戳、不改 mtime，并如实回传 ``changed: []``。
+    4. **正文长度门槛与 :func:`write_card` 一致**（``MIN_BODY_CHARS``）。
+       两处门槛不同的后果是「同一份内容换个入口就能进来」，而两边都返回成功。
+    5. **指纹（``contentHash``）会按新标题 + 新正文重算**，否则「重复写入判定」
+       会拿着旧指纹去比，同一份内容会被当成新内容重复建卡。
+    6. 文件**没有 frontmatter 段**时拒绝改动（不硬塞字段）—— 与
+       :func:`update_frontmatter` 同一取向。
+    """
+    vault = Path(vault)
+    path = (vault / rel_path).resolve()
+    # 防越界：rel_path 来自调用方，不允许指到 vault 之外
+    try:
+        rel = path.relative_to(vault.resolve()).as_posix()
+    except ValueError:
+        return {"ok": False, "changed": [],
+                "reason": f"路径不在 vault 内：{rel_path}"}
+
+    if not path.is_file():
+        return {"ok": False, "changed": [], "reason": f"卡片不存在：{rel_path}"}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "changed": [], "reason": f"读不了卡片（{rel}）：{exc}"}
+
+    parts = _split_card_text(text)
+    if parts is None:
+        return {"ok": False, "changed": [],
+                "reason": (f"{rel} 没有 frontmatter 段，无法原地改字段 —— "
+                           f"硬塞字段会造出一种半成品格式（开头几行像元数据但没有分隔符，"
+                           f"而索引端会把它们整段当成正文）。请先补上 --- 段，或删掉重建。")}
+    fm_lines, body_text = parts
+
+    # 读现值用 importer 的解析器，**不在这里再写一份**：本项目已经因为
+    # 「同一个意思、几处各写」吃过多次亏（tags 三份、档位标签两份）。
+    # 局部导入是为了不把 capture 与 importer 绑成模块级依赖（capture 是纯文件操作，
+    # 它不该在导入期就把索引端拖进来）。
+    from .importer import parse_frontmatter
+
+    meta, _ = parse_frontmatter(text)
+    current_title = str(meta.get("title") or "").strip()
+    current_kind = str(meta.get("kind") or DEFAULT_KIND).strip().lower()
+    current_tags = parse_tags(meta.get("tags", []))
+    current_source = str(meta.get("source") or "").strip()
+    current_ttl = str(meta.get("ttl", "") or "").strip()
+    try:
+        current_priority = int(str(meta.get("priority", "") or "0").strip())
+    except (TypeError, ValueError):
+        # 与 importer._parse_priority 同口径：非法值当 0。这里只用来判断「有没有变」，
+        # 不当校验 —— 一张卡写了 priority: 高 不该让 update 失败。
+        current_priority = 0
+
+    # 幂等标记从正文里摘出来单独看：它会被重算，不能混进「正文是否变化」的比较。
+    marker = _HASH_COMMENT_RE.search(body_text)
+    if marker:
+        body_text = body_text[: marker.start()] + body_text[marker.end() :]
+    current_body = body_text.strip()
+
+    if kind is not None:
+        wanted = str(kind or "").strip().lower()
+        if wanted and wanted != current_kind:
+            return {"ok": False, "changed": [], "rel_path": rel,
+                    "kind_current": current_kind, "kind_requested": wanted,
+                    "reason": (f"不支持改类型（kind）：{current_kind} → {wanted}。"
+                               f"kind 决定卡片所在目录，改它等于移动文件，"
+                               f"而路径是取代关系与读取统计的锚点。"
+                               f"若确实要换类型：先用 supersede 写一张新类型的新卡，"
+                               f"再 delete 旧卡。")}
+
+    updates: dict[str, str] = {}
+    changed: list[str] = []
+    new_title, new_body = current_title, current_body
+
+    if title is not None:
+        candidate = str(title).strip()
+        if not candidate:
+            return {"ok": False, "changed": [], "rel_path": rel,
+                    "reason": "标题不能改成空值"}
+        if candidate != current_title:
+            new_title = candidate
+            updates["title"] = _yaml_scalar(candidate)
+            changed.append("title")
+
+    if tags is not None:
+        candidate_tags = parse_tags(tags)
+        if candidate_tags != current_tags:
+            updates["tags"] = _yaml_list(candidate_tags)
+            changed.append("tags")
+
+    if priority is not None:
+        try:
+            candidate_priority = int(priority)
+        except (TypeError, ValueError):
+            return {"ok": False, "changed": [], "rel_path": rel,
+                    "reason": f"priority 必须是整数，收到：{priority!r}"}
+        if candidate_priority != current_priority:
+            updates["priority"] = str(candidate_priority)
+            changed.append("priority")
+
+    if ttl is not None:
+        candidate_ttl = str(ttl).strip()
+        if candidate_ttl != current_ttl:
+            updates["ttl"] = _yaml_scalar(candidate_ttl)
+            changed.append("ttl")
+
+    if source is not None:
+        candidate_source = str(source).strip()
+        if candidate_source != current_source:
+            updates["source"] = _yaml_scalar(candidate_source)
+            changed.append("source")
+
+    if body is not None:
+        candidate_body = str(body).strip()
+        if len(candidate_body) < MIN_BODY_CHARS:
+            return {"ok": False, "changed": [], "rel_path": rel,
+                    "reason": (f"正文过短（{len(candidate_body)} < {MIN_BODY_CHARS} 字符），"
+                               f"不值得占一张卡 —— 与 capture 是同一道门槛，"
+                               f"否则同一份内容换个入口就能进来。")}
+        if candidate_body != current_body:
+            new_body = candidate_body
+            changed.append("body")
+
+    if not changed:
+        # 不写盘、不刷时间戳。返回 ok=true 但明确 changed 为空 ——
+        # 「没变化」不是失败，也绝不能谎称改过了。
+        return {"ok": True, "changed": [], "rel_path": rel, "path": str(path),
+                "title": current_title,
+                "reason": "给定的值与卡片现值相同，未改动（updated 也未刷新）"}
+
+    updates["updated"] = _now_iso()
+    new_lines = _apply_frontmatter_updates(fm_lines, len(fm_lines) - 1, updates)
+    fingerprint = card_fingerprint(new_title, new_body)
+    new_text = ("\n".join(new_lines) + "\n" + new_body
+                + f"\n\n<!-- contentHash: {fingerprint} -->\n")
+    _atomic_write_text(path, new_text)
+
+    result = {
+        "ok": True,
+        "changed": changed,
+        "rel_path": rel,
+        "path": str(path),
+        "title": new_title,
+        "updated": updates["updated"],
+        "reason": f"已更新 {rel}（{', '.join(changed)}）",
+    }
+    if "title" in changed:
+        # 文件名与标题不一致是刻意的（路径是锚点），但必须说出来 ——
+        # 否则调用方按标题去找文件名会找不到，还以为卡片丢了。
+        result["note"] = (f"标题已改，但文件名保持不变（{path.name}）—— "
+                          f"移动文件会让取代关系与读取统计对不上。")
+    return result
 
 
 def supersede_card(
@@ -566,16 +821,7 @@ def write_card(
     text = text.rstrip("\n") + f"\n\n<!-- contentHash: {fingerprint} -->\n"
 
     # 原子写入：先写临时文件再改名，避免中途失败留下半截文件
-    tmp = path.with_suffix(".md.tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    _atomic_write_text(path, text)
 
     result = {"ok": True, "action": "created", "path": str(path),
               "reason": f"已写入 {KIND_DIRS[kind]}/"}

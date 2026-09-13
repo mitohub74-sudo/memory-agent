@@ -213,8 +213,11 @@ def main() -> int:
         r3 = c.request("tools/list")
         tools = r3.get("result", {}).get("tools", [])
         names = [t["name"] for t in tools]
-        check("返回 5 个工具", len(tools) == 5, str(names))
+        check("返回 8 个工具", len(tools) == 8, str(names))
+        # 改数字时必须**连带改这条循环** —— 只把 5 改成 8 而漏掉新名字，
+        # 等于断言只数了个数、没验是谁（这是 P3-02 方案里预先标出的注意点）。
         for want in ("memory_search", "memory_get", "memory_capture",
+                     "memory_update", "memory_supersede", "memory_delete",
                      "memory_stats", "memory_reindex"):
             check(f"包含 {want}", want in names)
         check("每个工具都有 inputSchema",
@@ -542,8 +545,148 @@ def main() -> int:
             c3.close()
             shutil.rmtree(tmp3, ignore_errors=True)
 
+        # ---------------------------------------------------- 三个新工具（P3-02）
+        print("\n[10] 生命周期工具：memory_update / memory_supersede / memory_delete")
+        tmp4 = Path(tempfile.mkdtemp(prefix="memory-agent-lifecycle-"))
+        _seed(tmp4)
+        c4 = Client(env=_env_for(tmp4))
+        try:
+            def call(name: str, **kwargs):
+                """调用一个工具，返回 (result 对象, 文本)。"""
+                r = c4.request("tools/call", {"name": name, "arguments": kwargs})
+                res = r.get("result", {})
+                content = res.get("content") or [{}]
+                return res, content[0].get("text", "")
+
+            def error_text(name: str, **kwargs) -> str:
+                res, txt = call(name, **kwargs)
+                return txt if res.get("isError") else ""
+
+            def ids(query: str) -> list[int]:
+                r = c4.request("tools/call", {"name": "memory_search",
+                                              "arguments": {"query": query}})
+                txt = r.get("result", {}).get("content", [{}])[0].get("text", "")
+                return [int(x) for x in re.findall(r"id=(\d+)", txt)]
+
+            # ---- 写一张带标记词的卡，作为这一段的题材（不干扰合成语料的档位断言）
+            res, txt = call("memory_capture", title="生命周期卡", kind="knowledge",
+                            body="这张卡的正文里有 zzlifeold 标记，长度足够建卡。")
+            check("新工具段落：写入成功", not res.get("isError"), txt[:120])
+            target = ids("zzlifeold")
+            check("新工具段落：能检索到刚写入的卡", len(target) == 1, str(target))
+
+            # ---- memory_update：事实写错了，原地改
+            card_id = target[0]
+            res, txt = call("memory_update", id=card_id,
+                            body="这张卡的正文里有 zzlifenew 标记，长度足够建卡。")
+            check("memory_update 返回成功", not res.get("isError"), txt[:160])
+            payload = json.loads(txt)
+            check("memory_update 报告变化字段为 body", payload.get("changed") == ["body"],
+                  str(payload.get("changed")))
+            check("memory_update 已重新索引", payload.get("indexed") is True, str(payload))
+            check("改完之后新正文可检索", len(ids("zzlifenew")) == 1)
+            check("旧正文搜不到了", ids("zzlifeold") == [], str(ids("zzlifeold")))
+
+            # 什么都没传：必须是「没改动」，不能谎称改过
+            res, txt = call("memory_update", id=card_id)
+            payload = json.loads(txt)
+            check("memory_update 无字段时 changed 为空", payload.get("changed") == [],
+                  str(payload))
+            check("memory_update 无字段时 indexed 为 null（未写盘）",
+                  payload.get("indexed") is None, str(payload))
+
+            # 改类型：明确报错，且不能变成「静默忽略」
+            msg = error_text("memory_update", id=card_id, kind="project")
+            check("memory_update 拒绝改 kind", "不支持改类型" in msg, msg[:160])
+            check("拒绝时给出替代做法", "supersede" in msg, msg[:200])
+
+            # ---- memory_supersede：事实变了
+            res, txt = call("memory_supersede", old_id=card_id,
+                            title="生命周期卡（新）",
+                            body="这张卡代表新的事实：zzlifenew 已改成 9090 端口。")
+            check("memory_supersede 返回成功", not res.get("isError"), txt[:200])
+            payload = json.loads(txt)
+            check("memory_supersede 已索引两张卡", payload.get("indexed") is True, str(payload))
+            old_path = Path(payload["old_path"])
+            check("旧卡文件仍在磁盘上", old_path.is_file(), str(old_path))
+            old_text = old_path.read_text(encoding="utf-8")
+            check("旧卡 frontmatter 标了 invalid_at", "invalid_at:" in old_text)
+            check("旧卡 frontmatter 标了 superseded_by", "superseded_by:" in old_text)
+            check("旧卡正文一字未动", "zzlifenew" in old_text, old_text[-120:])
+
+            # 默认检索只返回新卡（A1）
+            r = c4.request("tools/call", {"name": "memory_search",
+                                          "arguments": {"query": "生命周期卡"}})
+            only_new = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("取代后默认检索只见新卡", "生命周期卡（新）" in only_new, only_new[:300])
+            check("取代后默认检索不含旧卡",
+                  "id=%d" % card_id not in only_new, only_new[:300])
+
+            # memory_search 的 as_of：回溯
+            r = c4.request("tools/call", {"name": "memory_search",
+                                          "arguments": {"query": "生命周期卡",
+                                                        "as_of": "2020-01-01"}})
+            ancient = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("as_of 很久以前：那时什么都还没有", "没有与" in ancient, ancient[:200])
+
+            from datetime import datetime, timezone
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            r = c4.request("tools/call", {"name": "memory_search",
+                                          "arguments": {"query": "生命周期卡",
+                                                        "as_of": today}})
+            today_text = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("as_of 标注了回溯的时点", today in today_text, today_text[:200])
+            check("as_of 今天只见新卡", "生命周期卡（新）" in today_text, today_text[:300])
+
+            # 非法日期必须明确报错，不静默当成没传
+            msg = error_text("memory_search", query="生命周期卡", as_of="昨天")
+            check("memory_search 拒绝非法 as_of", "as-of" in msg, msg[:160])
+
+            # memory_get 打开失效卡：全文照常返回 + 显式标注（A2 / 矩阵 #8）
+            r = c4.request("tools/call", {"name": "memory_get",
+                                          "arguments": {"id": card_id, "full": True}})
+            got = r.get("result", {}).get("content", [{}])[0].get("text", "")
+            check("memory_get 仍能取回旧卡全文", "zzlifenew" in got, got[:200])
+            check("memory_get 标注了已失效", "已" in got and "失效" in got, got[:200])
+            check("memory_get 给出了回溯用法", "as_of" in got, got[:240])
+
+            # ---- memory_delete：软删
+            # 用一张**独立的**卡做删除，别拿上面那张被取代的旧卡：
+            # 那张卡的标记词在新卡正文里也出现了，删掉它之后检索仍会命中新卡，
+            # 「搜不到」的断言就测不出东西（第一版就是这么写错的）。
+            res, txt = call("memory_capture", title="待软删卡", kind="knowledge",
+                            body="这张卡的正文里有 zzdeltest 标记，长度足够建卡。")
+            check("软删用卡写入成功", not res.get("isError"), txt[:120])
+            del_ids = ids("zzdeltest")
+            check("软删用卡可检索到", len(del_ids) == 1, str(del_ids))
+
+            res, txt = call("memory_delete", id=del_ids[0])
+            check("memory_delete 返回成功", not res.get("isError"), txt[:200])
+            payload = json.loads(txt)
+            check("memory_delete 是软删（写明可恢复）",
+                  "软删" in payload.get("note", ""), str(payload.get("note"))[:120])
+            check("memory_delete 已从索引摘除", payload.get("indexed") is True, str(payload))
+            check("memory_delete 回传回收站张数", payload.get("trash_count") == 1,
+                  str(payload.get("trash_count")))
+            check("软删后搜不到这张卡", ids("zzdeltest") == [], str(ids("zzdeltest")))
+            trash_file = Path(payload["path"])
+            check("卡片文件在回收站里（未销毁）", trash_file.is_file(), str(trash_file))
+            check("回收站文件保留原相对路径",
+                  "vault" in str(trash_file) and ".trash" in trash_file.as_posix(),
+                  trash_file.as_posix())
+
+            # stats 必须报出回收站，否则「不自动清理」就没有任何提示渠道
+            res, txt = call("memory_stats")
+            stats_payload = json.loads(txt)
+            check("memory_stats 报告回收站张数",
+                  stats_payload.get("trash", {}).get("count") == 1,
+                  str(stats_payload.get("trash")))
+        finally:
+            c4.close()
+            shutil.rmtree(tmp4, ignore_errors=True)
+
         # ---------------------------------------------------- stdout 纯净
-        print("\n[10] stdout 纯净性（最关键）")
+        print("\n[11] stdout 纯净性（最关键）")
         bad = []
         for line in c.stdout_lines:
             if not line.strip():

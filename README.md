@@ -341,13 +341,21 @@ stdio 传输，每行一条 JSON-RPC 2.0 消息。协议版本 `2025-06-18` / `2
 
 | 工具 | 用途 |
 |---|---|
-| `memory_search` | 检索记忆，返回摘要 + id。参数 `query` `limit`（上限 20）`kind` `source` |
-| `memory_get` | 用 id 取卡片全文（长卡分片返回，见下） |
+| `memory_search` | 检索记忆，返回摘要 + id。参数 `query` `limit`（上限 20）`kind` `source` `as_of` |
+| `memory_get` | 用 id 取卡片全文（长卡分片返回，见下；已失效的卡会显式标注） |
 | `memory_capture` | **写入**一条知识并立即索引本卡。参数 `title` `body` `kind` `tags` |
-| `memory_stats` | 库概览（总数、类型/来源分布、最近更新） |
+| `memory_update` | 原地改一张卡（**记忆本身写错了**用这个）。参数 `id` + 要改的字段 |
+| `memory_supersede` | 写新卡并让旧卡失效（**事实变了**用这个，旧值仍可回溯）。参数 `old_id` `title` `body` |
+| `memory_delete` | **软删**一张卡到回收站（可恢复，不是销毁）。参数 `id` |
+| `memory_stats` | 库概览（总数、类型/来源分布、最近更新、回收站张数） |
 | `memory_reindex` | 手动补建索引（增量或 `rebuild` 全量）。正常写入已自动索引，此工具用于索引丢失或外部改动后补建 |
 
-工具描述是接口的一部分 —— LLM 靠它判断何时调用，写得含糊 agent 就不会用。
+三个生命周期工具对应 CLI 的 `update` / `supersede` / `delete`，**共用同一份库层实现** ——
+两个入口各写一套的话，迟早在一个细节上分叉，而两边都返回成功。
+
+**工具描述是接口的一部分** —— LLM 靠它判断何时调用。所以这三个描述里写清了三件事：
+什么时候该用哪个（写错了用 `memory_update`、变了用 `memory_supersede`）、
+删除是软删可恢复、`as_of` 用来回答「当时是什么」。
 
 ### 客户端配置
 

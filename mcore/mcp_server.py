@@ -86,6 +86,15 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "可选，按来源 agent 过滤",
                 },
+                "as_of": {
+                    "type": "string",
+                    "description": (
+                        "可选，回溯到**某一天当时有效**的记忆（格式 YYYY-MM-DD）。"
+                        "默认只返回当前有效的记忆 —— 被取代的旧事实不会出现在结果里。"
+                        "当你要回答「当时是什么」而不是「现在是什么」时用它，"
+                        "例如「上周部署在哪台机器」「改之前端口是多少」。"
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -182,6 +191,85 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_update",
+        "description": (
+            "修改一张已存在卡片的内容 —— **当这条记忆本身写错了的时候**用"
+            "（错别字、错误的路径/端口、漏掉的参数、需要补充说明）。"
+            "只改你传进来的字段，其余内容一字不动。"
+            "**关键区别**：如果事实本身**变了**（服务迁了地址、端口换了、价格变了），"
+            "不要用它 —— 那些要保留「当时是多少」，请改用 memory_supersede，"
+            "否则历史会被静默抹掉。"
+            "不支持改类型（kind）：类型决定卡片所在目录，改它等于移动文件，"
+            "而路径是取代关系与读取统计的锚点；要换类型就先用 memory_supersede 写一张"
+            "新类型的新卡，再 memory_delete 旧卡。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "number", "description": "卡片 id，来自 memory_search 结果"},
+                "title": {"type": "string",
+                          "description": "新标题。**文件名不会变**（路径是取代与统计的锚点）"},
+                "body": {"type": "string", "description": "新正文。不给则不动正文"},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "新标签（整体替换；传空数组清空标签）"},
+                "kind": {"type": "string",
+                         "description": "**只用于显式报错**：不支持改类型，见工具说明"},
+                "priority": {"type": "number", "description": "优先级（整数）"},
+                "ttl": {"type": "string",
+                        "description": "有效期，如 30d / 12h / 2026-10-01；空串表示永不过期"},
+                "source": {"type": "string", "description": "来源标记"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "memory_supersede",
+        "description": (
+            "**事实变了**的时候用它：写一张新卡，并让被取代的旧卡失效。"
+            "旧卡文件**仍在磁盘上**（只是不再出现在默认检索里），"
+            "所以以后还能回答「当时是多少」—— 这正是它与 memory_update 的分工。"
+            "什么时候用：地址/端口/价格/配置项当前值发生了**真实变化**，"
+            "而旧值对以后仍有参考价值（迁移记录、故障复盘、变更历史）。"
+            "写新卡时请给出完整的新事实（别写成「同上，只是端口改了」），"
+            "因为以后检索到它时，旧卡不会一起出现。"
+            "已经失效的卡不能再被取代（历史链会断），要改当前有效的那张。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "old_id": {"type": "number",
+                           "description": "被取代的旧卡 id，来自 memory_search 结果"},
+                "title": {"type": "string", "description": "新卡标题"},
+                "body": {"type": "string", "description": "新卡正文（写清完整的新事实）"},
+                "kind": {"type": "string",
+                         "description": "新卡类型；不给则沿用旧卡的类型"},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "新卡标签"},
+                "source": {"type": "string", "description": "新卡来源标记，默认取调用方"},
+            },
+            "required": ["old_id", "title", "body"],
+        },
+    },
+    {
+        "name": "memory_delete",
+        "description": (
+            "删除一张卡片。**这是软删，不是销毁**：卡片被移到回收站，随时可以恢复，"
+            "所以不用担心「删错了就没了」。"
+            "什么时候用：这条记忆确实不该留在库里（写错了且没有修正价值、"
+            "过期的临时状态、不该记的内容）。"
+            "若只是事实变了，请用 memory_supersede —— 那会保留旧值，"
+            "而删除会让「曾经是什么」不可查。"
+            "回收站不会自动清理，需要时由人来清。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "number", "description": "卡片 id，来自 memory_search 结果"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
         "name": "memory_stats",
         "description": (
             "查看记忆库概览：卡片总数、类型与来源分布、最近更新。"
@@ -269,20 +357,30 @@ class MemoryServer:
 
         limit = search.clamp_limit(args.get("limit") or 5)
 
+        try:
+            # 与 CLI 的 --as-of 共用同一个校验（非法日期明确报错，不静默当成没传）。
+            as_of = search.normalize_as_of(args.get("as_of"))
+        except ValueError as exc:
+            return _err(str(exc))
+
         hits = search.KeywordSearcher(self.conn).search(
             query,
             limit=limit,
             kind=args.get("kind") or None,
             source=args.get("source") or None,
+            as_of=as_of,
         )
 
         if not hits:
+            if as_of:
+                return _ok(f"在 {as_of} 那一天，记忆库中没有与「{query}」相关的内容。")
             return _ok(f"记忆库中没有与「{query}」相关的内容。")
 
         # 标签来自 search.MODE_LABELS（唯一来源）—— 档位的语义定义在那边，
         # 名字就该跟着语义走，不要在这个文件里再写一份。
         mode = search.mode_label(hits[0].matched)
-        lines = [f"命中 {len(hits)} 条  (query={query}, 匹配模式={mode})", ""]
+        scope = f", 回溯到 {as_of} 当时有效" if as_of else ""
+        lines = [f"命中 {len(hits)} 条  (query={query}, 匹配模式={mode}{scope})", ""]
         for i, h in enumerate(hits, 1):
             # 覆盖率只在放宽档显示：精确档恒为 1.0，写出来只是噪音。
             cover = "" if h.matched in ("all", "all-prefix") else f"  覆盖率={h.coverage:.0%}"
@@ -340,7 +438,19 @@ class MemoryServer:
             f"（offset={window['offset']}）\n"
             f"{'-' * 60}\n"
         )
-        text = head + window["text"]
+        # A2：已失效的卡**全文照常返回**，但必须显式标注。
+        # 默认检索不会返回它，所以打开它的人（或 agent）要先看到「这不是当前事实」——
+        # 否则会把历史当成现状用，而这种错误是静默的。
+        text = ""
+        if row["invalid_at"]:
+            by = f"，被 {row['superseded_by']} 取代" if row["superseded_by"] else ""
+            text += (f"⚠ 这张卡已于 {row['invalid_at']} 失效{by}。"
+                     f"默认检索不会再返回它 —— 这是**历史事实**，不是当前状态。"
+                     f"要查当时的事实用 memory_search(as_of=<日期>)。\n"
+                     f"{'-' * 60}\n")
+        if row["supersedes"]:
+            text += f"（本卡取代了 {row['supersedes']}）\n{'-' * 60}\n"
+        text += head + window["text"]
         if window["has_more"]:
             # 截断必须显式说明并给出续读位置。悄悄砍掉后半段、当成全文返回，
             # 就是「能返回的假成功」—— 调用方会以为卡片就这么短。
@@ -426,6 +536,165 @@ class MemoryServer:
             payload["warning"] = warning
         return _ok(json.dumps(payload, ensure_ascii=False, indent=2))
 
+    def memory_update(self, args: dict) -> dict:
+        """原地改卡（P3-02）。与 CLI 的 ``update`` 共用 ``capture.update_card``。"""
+        try:
+            card_id = int(args.get("id"))
+        except (TypeError, ValueError):
+            return _err("缺少有效的 id 参数（数字）。")
+
+        if self._index_missing():
+            return _err(f"索引不存在：{config.db_path()}")
+
+        row = store.get_card(self.conn, card_id)
+        if row is None:
+            return _err(f"找不到 id={card_id} 的卡片。")
+
+        vault = config.vault_path()
+        # 「没传」与「传了空值」必须区分：前者=别动这个字段，后者=清空。
+        # 一律用 args.get 的默认值就会把「清空标签」变成「没传」。
+        result = capture.update_card(
+            vault,
+            row["rel_path"],
+            title=args.get("title") if "title" in args else None,
+            body=args.get("body") if "body" in args else None,
+            kind=args.get("kind") if "kind" in args else None,
+            tags=parse_tags(args.get("tags")) if "tags" in args else None,
+            priority=args.get("priority") if "priority" in args else None,
+            ttl=args.get("ttl") if "ttl" in args else None,
+            source=args.get("source") if "source" in args else None,
+        )
+
+        if not result["ok"]:
+            return _err(f"未修改：{result['reason']}")
+
+        # indexed 三态，与 CLI 的 update 一致：
+        #   true 已重新索引 / false 写盘成功但索引失败 / null 没有字段变化、未写盘
+        indexed: bool | None = None
+        warning = ""
+        if result["changed"]:
+            try:
+                store.init(self.conn)
+                importer.sync_one(self.conn, vault, result["path"])
+                store.commit(self.conn)
+                indexed = True
+            except Exception as exc:
+                indexed = False
+                warning = (f"卡片已改（{result['path']}），但索引失败：{exc}。"
+                           f"可调用 memory_reindex 补建。")
+
+        payload = {"id": card_id, **result, "indexed": indexed}
+        if warning:
+            payload["warning"] = warning
+        if not result["changed"]:
+            payload["note"] = "给定的值与卡片现值相同，没有改动（updated 也未刷新）。"
+        return _ok(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def memory_supersede(self, args: dict) -> dict:
+        """写新卡并让旧卡失效（P3-02）。与 CLI 的 ``supersede`` 同源。"""
+        try:
+            old_id = int(args.get("old_id"))
+        except (TypeError, ValueError):
+            return _err("缺少有效的 old_id 参数（数字）。")
+
+        title = str(args.get("title") or "").strip()
+        body = str(args.get("body") or "").strip()
+        if not title or not body:
+            return _err("title 与 body 均为必填 —— 取代会写出一张新卡，"
+                        "它的内容必须写清楚（旧卡以后不会再出现在检索结果里）。")
+
+        if self._index_missing():
+            return _err(f"索引不存在：{config.db_path()}")
+
+        old = store.get_card(self.conn, old_id)
+        if old is None:
+            return _err(f"找不到 id={old_id} 的卡片。")
+
+        vault = config.vault_path()
+        # 不给 kind 时沿用旧卡的类型：取代默认是「同一件事变了」，
+        # 类型跟着变会让卡片悄悄换目录（目录是路径的一部分）。
+        result = capture.supersede_card(
+            vault,
+            old["rel_path"],
+            title=title,
+            body=body,
+            kind=str(args.get("kind") or old["kind"] or capture.DEFAULT_KIND),
+            tags=parse_tags(args.get("tags")),
+            source=str(args.get("source") or self.client_name),
+        )
+        if not result["ok"]:
+            return _err(f"未取代：{result['reason']}")
+
+        # **两张卡都要重新索引**：只索引新卡的话，旧卡在索引里仍是「有效」，
+        # 默认检索照样返回它，而这个工具返回的是成功。
+        indexed, warning = False, ""
+        try:
+            store.init(self.conn)
+            importer.sync_one(self.conn, vault, result["new_path"])
+            importer.sync_one(self.conn, vault, result["old_path"])
+            store.commit(self.conn)
+            indexed = True
+        except Exception as exc:
+            warning = (f"两张卡都已落盘，但索引失败：{exc}。"
+                       f"可调用 memory_reindex 补建。")
+
+        payload = {"old_id": old_id, **result, "indexed": indexed,
+                   "note": ("旧卡文件仍在磁盘上、只是标了失效；"
+                            "以后要查当时的事实用 memory_search(as_of=<日期>)。")}
+        if warning:
+            payload["warning"] = warning
+        return _ok(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def memory_delete(self, args: dict) -> dict:
+        """软删一张卡（P3-02）。与 CLI 的 ``delete`` 同源 —— 可恢复，不清统计。"""
+        try:
+            card_id = int(args.get("id"))
+        except (TypeError, ValueError):
+            return _err("缺少有效的 id 参数（数字）。")
+
+        if self._index_missing():
+            return _err(f"索引不存在：{config.db_path()}")
+
+        row = store.get_card(self.conn, card_id)
+        if row is None:
+            return _err(f"找不到 id={card_id} 的卡片。")
+
+        vault = config.vault_path()
+        result = capture.delete_card(vault, row["rel_path"])
+        if not result["ok"]:
+            return _err(f"未删除：{result['reason']}")
+
+        # 索引里精确摘掉这一行，但**保留 card_stats**（软删可恢复）。
+        # 真删（CLI 的 delete --purge）才清统计。
+        indexed, warning = False, ""
+        try:
+            store.init(self.conn)
+            store.delete_cards(self.conn, [row["rel_path"]], keep_stats=True)
+            store.commit(self.conn)
+            indexed = True
+        except Exception as exc:
+            warning = (f"文件已移入回收站（{result['trash_path']}），但索引未更新：{exc}。"
+                       f"可调用 memory_reindex 补建。")
+
+        summary = capture.trash_summary(vault)
+        payload = {
+            "id": card_id,
+            **result,
+            "indexed": indexed,
+            "trash_count": summary["count"],
+            "note": ("这是**软删**：文件在回收站里，未销毁，恢复后读取次数接得上。"
+                     "彻底删除需要人在命令行执行 delete --purge。"),
+        }
+        if warning:
+            payload["warning"] = warning
+        if summary["count"] >= capture.TRASH_REMIND_THRESHOLD:
+            payload["reminder"] = (
+                f"回收站已积累 {summary['count']} 张卡。回收站不会自动清理，"
+                f"确认不再需要后请让人在命令行执行："
+                f"python memory.py delete --purge --older-than 30d"
+            )
+        return _ok(json.dumps(payload, ensure_ascii=False, indent=2))
+
     def memory_stats(self, args: dict) -> dict:
         if self._index_missing():
             return _err(f"索引不存在：{config.db_path()}")
@@ -441,6 +710,8 @@ class MemoryServer:
             # 注意口径：它记的是「被 memory_get 取过全文的次数」，
             # 不是「被写入的次数」，也不是「被检索召回的次数」。
             "most_accessed": store.access_stats(self.conn, limit=5),
+            # 回收站单独报：它是**软删**的落点，不自动清理 —— 提醒归提醒，动手要人来。
+            "trash": capture.trash_summary(config.vault_path()),
             "db": str(config.db_path()),
             "vault": str(config.vault_path()),
         }

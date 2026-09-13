@@ -137,9 +137,19 @@ def cmd_search(args) -> int:
         return 2
 
     limit = search.clamp_limit(args.limit)
+    try:
+        # 日期在这里校验（与 MCP 共用同一个实现）。不合法就明确失败 ——
+        # 静默当成「没传日期」会让调用方拿到一批看起来正常的结果。
+        as_of = search.normalize_as_of(args.as_of)
+    except ValueError as exc:
+        payload = {"ok": False, "error": str(exc)}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 2
+
     conn = store.connect(db)
     hits = search.KeywordSearcher(conn).search(
-        args.query, limit=limit, kind=args.kind, source=args.source
+        args.query, limit=limit, kind=args.kind, source=args.source,
+        as_of=as_of, include_invalid=args.include_invalid,
     )
     conn.close()
 
@@ -153,6 +163,10 @@ def cmd_search(args) -> int:
         # coverage 只反映「命中了多少查询词」，**没有参与排序**（见 search.Hit 的说明）。
         "confidence_note": (search.low_confidence_note(hits[0].matched, hits[0].coverage)
                             if hits else ""),
+        # 回溯参数原样回传：调用方（和人）必须能看出「这批结果是哪个时点的视图」，
+        # 否则历史结果会被当成当前事实。
+        "as_of": as_of,
+        "include_invalid": bool(args.include_invalid),
         "results": [
             {
                 "id": h.card_id,
@@ -165,6 +179,8 @@ def cmd_search(args) -> int:
                 "matched_label": search.mode_label(h.matched),
                 "coverage": h.coverage,
                 "snippet": h.snippet,
+                # 默认检索里恒为空；显式要失效卡时用它标注「这条已经过期」。
+                "invalid_at": h.invalid_at,
             }
             for h in hits
         ],
@@ -174,11 +190,17 @@ def cmd_search(args) -> int:
         if not d["results"]:
             print(f"未命中：{d['query']}")
             return
-        print(f"命中 {d['count']} 条  (query={d['query']}, 匹配模式={d['mode']})\n")
+        scope = ""
+        if d["as_of"]:
+            scope = f"，回溯到 {d['as_of']} 当时有效"
+        elif d["include_invalid"]:
+            scope = "，含已失效的卡"
+        print(f"命中 {d['count']} 条  (query={d['query']}, 匹配模式={d['mode']}{scope})\n")
         for i, r in enumerate(d["results"], 1):
             # 精确档覆盖率恒为 1.0，显示出来只是噪音，所以只在放宽档显示。
             cover = "" if r["matched"] in ("all", "all-prefix") else f"  覆盖率={r['coverage']:.0%}"
-            print(f"{i}. [{r['score']:.3f}] {r['title']}  (id={r['id']}){cover}")
+            stale = f"  ⚠已于 {r['invalid_at']} 失效" if r["invalid_at"] else ""
+            print(f"{i}. [{r['score']:.3f}] {r['title']}  (id={r['id']}){cover}{stale}")
             print(f"   {r['path']}  {r['kind']}  {r['source']}")
             if r["snippet"]:
                 print(f"   {r['snippet']}")
@@ -277,10 +299,24 @@ def cmd_show(args) -> int:
         "updated": row["updated"],
         "access_count": stat.get("access_count", 1),
         "last_accessed": stat.get("last_accessed", 0),
+        # 失效与取代关系（A2）：旧卡**原文照常返回**，只是明确标注它已经被取代。
+        # 「取代」的语义是默认检索里不再返回，不是把内容藏起来 ——
+        # 拿到 id 却打不开，会让 --as-of 的价值大打折扣。
+        "invalid_at": row["invalid_at"] or "",
+        "superseded_by": row["superseded_by"] or "",
+        "supersedes": row["supersedes"] or "",
         **window,
     }
 
     def render(d):
+        # 标注放在正文**之前**：默认检索不会返回它，所以打开它的人（或 agent）
+        # 必须先看到「这条已经不是当前事实」，否则会把历史当成现状用。
+        if d["invalid_at"]:
+            by = f"，被 {d['superseded_by']} 取代" if d["superseded_by"] else ""
+            print(f"⚠ 这张卡已于 {d['invalid_at']} 失效{by} —— "
+                  f"默认检索不会再返回它；要查当时的事实用 search <词> --as-of <日期>\n")
+        if d["supersedes"]:
+            print(f"（本卡取代了 {d['supersedes']}）\n")
         head = (f"# {d['title']}\n{d['path']}\n"
                 f"长度 {d['length']} 字符，本次返回 {d['returned']}"
                 f"（offset={d['offset']}）\n")
@@ -666,6 +702,76 @@ def _delete_purge(args, vault) -> int:
     return 0
 
 
+def cmd_supersede(args) -> int:
+    """写一张新卡，并让指定的旧卡失效（P3-02 的取代语义）。
+
+    **成对操作**：新卡出现与旧卡失效必须同时发生。所以它做成一个命令，
+    而不是「capture 时传 --supersedes」—— 两步的话，中间失败会留下
+    「两张卡都有效」的状态，而检索看不出异常。
+    """
+    db = config.db_path(args.db)
+    if not _require_db(db, args.json):
+        return 2
+
+    conn = store.connect(db)
+    old = store.get_card(conn, args.old_id)
+    conn.close()
+    if old is None:
+        payload = {"ok": False, "error": f"找不到 id={args.old_id}"}
+        _emit(payload, args.json, lambda d: print(d["error"], file=sys.stderr))
+        return 1
+
+    vault = config.vault_path(args.vault)
+    # --kind 不给时**沿用旧卡的类型**：取代默认是「同一件事变了」，
+    # 类型跟着变会让卡片悄悄换目录（而目录是路径的一部分）。想换类型要显式说。
+    kind = args.kind or (old["kind"] or capture.DEFAULT_KIND)
+    result = capture.supersede_card(
+        vault,
+        old["rel_path"],
+        title=args.title,
+        body=args.body,
+        kind=kind,
+        tags=parse_tags(args.tags),
+        source=args.source,
+    )
+
+    if not result["ok"]:
+        _emit(result, args.json,
+              lambda d: print(f"未取代：{d['reason']}", file=sys.stderr))
+        return 1
+
+    # **两张卡都要重新索引**：新卡是新面孔，旧卡的 frontmatter 多了 invalid_at ——
+    # 只索引新卡的话，旧卡在索引里仍是「有效」，默认检索照样返回它，
+    # 而命令返回的是「成功」。
+    indexed, warning = False, ""
+    try:
+        conn = store.connect(db)
+        store.init(conn)
+        importer.sync_one(conn, vault, result["new_path"])
+        importer.sync_one(conn, vault, result["old_path"])
+        store.commit(conn)
+        conn.close()
+        indexed = True
+    except Exception as exc:
+        warning = (f"两张卡都已落盘，但索引未更新：{exc}。"
+                   f"可运行 python memory.py index 补建。")
+
+    payload = {"old_id": args.old_id, **result, "indexed": indexed}
+    if warning:
+        payload["warning"] = warning
+
+    def render(d):
+        mark = "已索引" if d["indexed"] else "未索引"
+        print(f"已取代 {d['old_rel']}  ->  {d['new_rel']}  [{mark}]")
+        print(f"  旧卡文件仍在磁盘上，只是标了失效（{d['invalid_at']}）")
+        print("  回溯当时的事实的用法：memory.py search <词> --as-of <该日期>")
+        if d.get("warning"):
+            print(d["warning"], file=sys.stderr)
+
+    _emit(payload, args.json, render)
+    return 0
+
+
 def cmd_mcp(args) -> int:
     """启动 MCP stdio server。stdout 是协议通道，日志走 stderr。"""
     return mcp_server.serve()
@@ -728,6 +834,11 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("-n", "--limit", type=int, default=10)
     ps.add_argument("--kind", help="按类型过滤")
     ps.add_argument("--source", help="按来源过滤")
+    ps.add_argument("--as-of", dest="as_of", metavar="YYYY-MM-DD",
+                    help="回溯：只看**那一天当时有效**的卡（默认只看当前有效的）。"
+                         "旧卡被取代后不进默认检索，要查当时的事实用这个")
+    ps.add_argument("--include-invalid", dest="include_invalid", action="store_true",
+                    help="连已失效（被取代）的卡一起返回，并在结果里标注失效时间")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=cmd_search)
 
@@ -811,6 +922,22 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--vault", help="vault 目录")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=cmd_delete)
+
+    psup = sub.add_parser(
+        "supersede",
+        help="写一张新卡并让旧卡失效（事实**变了**用这个；事实写错了用 update）")
+    psup.add_argument("old_id", type=int, help="被取代的旧卡 id（来自 search 结果）")
+    psup.add_argument("--title", required=True, help="新卡标题")
+    psup.add_argument("--body", required=True,
+                      help="新卡正文。**必填且不从 stdin 读** —— 取代会写出一张新卡，"
+                           "它的内容必须由调用方明确给出；含糊的默认值等于让"
+                           "「新事实是什么」变成一个意外")
+    psup.add_argument("--kind", help="新卡类型；不给则沿用旧卡的类型")
+    psup.add_argument("--tags", help="新卡标签，逗号分隔")
+    psup.add_argument("--source", default="agent", help="新卡来源标记，默认 agent")
+    psup.add_argument("--vault", help="vault 目录")
+    psup.add_argument("--json", action="store_true")
+    psup.set_defaults(func=cmd_supersede)
 
     return p
 

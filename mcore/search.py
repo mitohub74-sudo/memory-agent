@@ -17,14 +17,17 @@ KeywordSearcher
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .tokenize import query_terms, to_query_expr
 
 __all__ = ["Hit", "Searcher", "KeywordSearcher", "MIN_LIMIT", "MAX_LIMIT", "clamp_limit",
-           "MODE_LABELS", "mode_label", "compute_coverage", "low_confidence_note"]
+           "MODE_LABELS", "mode_label", "compute_coverage", "low_confidence_note",
+           "normalize_as_of"]
 
 # 检索条数边界。CLI 与 MCP 共用同一组常量 —— 两处各写一份迟早漂移。
 MIN_LIMIT = 1
@@ -43,6 +46,38 @@ def clamp_limit(value: int | str | None) -> int:
     except (TypeError, ValueError):
         n = MIN_LIMIT
     return max(MIN_LIMIT, min(n, MAX_LIMIT))
+
+
+# ``--as-of`` 只按**天**比较，所以任何输入都被截到前 10 个字符。
+_AS_OF_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def normalize_as_of(value) -> str:
+    """把 ``as_of`` 规范成 ``YYYY-MM-DD``；不合法时抛 ``ValueError``。
+
+    **必须校验，不能放过。** 过滤是拿日期当**字符串**比的（``substr(created,1,10) <= ?``），
+    所以 ``--as-of 昨天`` 这种输入不会报错，而是安静地走成某种结果：
+    ASCII 里数字小于字母，于是 ``'2026-09-13' <= '昨天'`` 恒真 —— 存在性过滤形同不存在，
+    只剩有效性过滤生效。调用方拿到一批「看起来正常」的结果，却不知道日期条件没起作用。
+
+    截断到**天**是因为 ``search --as-of 2026-09-01`` 的直觉是「9 月 1 日那天」：
+    按时刻比较的话，当天 11:30 写下的卡会因「11:30 > 00:00」被判成当时还不存在。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    m = _AS_OF_RE.match(text)
+    if not m:
+        raise ValueError(
+            f"as-of 需要 YYYY-MM-DD 形式的日期（也可给完整时刻，只取日期部分），"
+            f"收到：{value!r}"
+        )
+    day = m.group(1)
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"as-of 不是真实存在的日期：{day!r}") from exc
+    return day
 
 
 # 档位 → 对外标签。**这是唯一来源**，CLI 与 MCP 都从这里取。
@@ -334,7 +369,12 @@ class KeywordSearcher:
 
         两个参数都只影响**可见性**，不影响排序：具体的过滤在 ``_run`` 里，
         排序永远只有 bm25 一个来源。
+
+        ``as_of`` 不合法时抛 ``ValueError``（由 :func:`normalize_as_of` 校验）。
+        **不在这里静默回退**：把非法日期当成「没传」，会让调用方拿到一批看起来正常的
+        结果，却不知道日期条件根本没生效。
         """
+        as_of = normalize_as_of(as_of)
         terms = query_terms(query)
         if not terms:
             return []
